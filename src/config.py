@@ -1,17 +1,9 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import os
+from dotenv import load_dotenv
 
+load_dotenv()
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        case_sensitive=True,
-        extra="ignore",
-    )
-
-    OCR_FOLDER_ID: str
-    OCR_ACCESS_KEY: str
-    OCR_SECRET_KEY: str
-    OCR_BUCKET_NAME: str
-
-
-settings = Settings()
+FOLDER_ID = os.getenv("FOLDER_ID")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY")
