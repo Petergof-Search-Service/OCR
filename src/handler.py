@@ -43,7 +43,8 @@ def handler(event, context):
         ocr.process_pdf(
             input_pdf_bytes=input_pdf_bytes,
             max_concurrent=10,
-            cleanup_tmp_s3=True,  # True, если хочешь удалять OCR-tmp после завершения
+            batch_size=10,
+            cleanup_tmp_s3=True,
         )
     )
 
