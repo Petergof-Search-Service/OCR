@@ -3,6 +3,7 @@ import json
 import base64
 import asyncio
 from pathlib import Path
+import random
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -43,8 +44,8 @@ class YandexOCRAsync:
     # S3 path helpers
     # =========================
 
-    def _tmp_chunk_s3_key(self, page_number: int) -> str:
-        return f"{self.tmp_prefix}/chunk_{page_number}.pdf"
+    def _tmp_batch_s3_key(self, batch_id: int) -> str:
+        return f"{self.tmp_prefix}/batch_{batch_id}.pdf"
 
     def _tmp_image_s3_key(self, page_number: int) -> str:
         return f"{self.tmp_prefix}/img_{page_number}.pdf"
@@ -86,7 +87,6 @@ class YandexOCRAsync:
             params["ContentType"] = content_type
 
         self.s3.put_object(**params)
-        print(f"Uploaded: {s3_key}")
 
     def download_bytes_from_s3(self, s3_key: str) -> bytes:
         obj = self.s3.get_object(Bucket=self.bucket, Key=s3_key)
@@ -95,7 +95,6 @@ class YandexOCRAsync:
     def delete_s3_object(self, s3_key: str) -> None:
         try:
             self.s3.delete_object(Bucket=self.bucket, Key=s3_key)
-            print(f"Deleted: {s3_key}")
         except Exception as exc:
             print(f"Failed to delete {s3_key}: {exc}")
 
@@ -119,7 +118,6 @@ class YandexOCRAsync:
                     Bucket=self.bucket,
                     Delete={"Objects": objects},
                 )
-                print(f"Deleted {len(objects)} temp objects from {self.tmp_prefix}/")
 
             if not response.get("IsTruncated"):
                 break
@@ -153,35 +151,49 @@ class YandexOCRAsync:
         )
 
     # =========================
-    # Split / merge
+    # Split into batches
     # =========================
 
-    def split_pdf(self, input_pdf_bytes: bytes) -> List[Tuple[str, int]]:
-        """
-        Split input PDF into single-page PDFs and upload them to S3 OCR-tmp
-        Returns list of tuples: (chunk_s3_key, page_number)
-        """
-        chunks: List[Tuple[str, int]] = []
+    def split_pdf_to_batches(self, input_pdf_bytes: bytes, batch_size: int = 3) -> List[Tuple[str, List[int], int]]:
         reader = PdfReader(io.BytesIO(input_pdf_bytes))
+        batches: List[Tuple[str, List[int], int]] = []
+        batch_id = 0
 
-        for page_number, page in enumerate(reader.pages):
+        for i in range(0, len(reader.pages), batch_size):
             writer = PdfWriter()
-            writer.add_page(page)
+            page_numbers = []
+
+            for j in range(i, min(i + batch_size, len(reader.pages))):
+                writer.add_page(reader.pages[j])
+                page_numbers.append(j)
 
             buffer = io.BytesIO()
             writer.write(buffer)
-            chunk_bytes = buffer.getvalue()
+            batch_bytes = buffer.getvalue()
 
-            chunk_s3_key = self._tmp_chunk_s3_key(page_number)
+            batch_key = self._tmp_batch_s3_key(batch_id)
             self.upload_bytes_to_s3(
-                chunk_bytes,
-                chunk_s3_key,
+                batch_bytes,
+                batch_key,
                 content_type="application/pdf",
             )
 
-            chunks.append((chunk_s3_key, page_number))
+            batches.append((batch_key, page_numbers, batch_id))
+            batch_id += 1
 
-        return chunks
+        return batches
+
+    def extract_single_page(self, batch_bytes: bytes, page_index: int) -> bytes:
+        reader = PdfReader(io.BytesIO(batch_bytes))
+        writer = PdfWriter()
+        writer.add_page(reader.pages[page_index])
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        return buffer.getvalue()
+
+    # =========================
+    # Merge functions
+    # =========================
 
     def merge_txt_files(self, total_pages: int) -> bytes:
         parts: List[str] = []
@@ -213,14 +225,12 @@ class YandexOCRAsync:
 
     def merge_pdfs(self, total_pages: int) -> bytes:
         writer = PdfWriter()
-        readers: List[PdfReader] = []
 
         for page_number in range(total_pages):
             s3_key = self._tmp_overlay_pdf_s3_key(page_number)
             try:
                 pdf_bytes = self.download_bytes_from_s3(s3_key)
                 reader = PdfReader(io.BytesIO(pdf_bytes))
-                readers.append(reader)
                 writer.add_page(reader.pages[0])
             except Exception as exc:
                 print(f"Failed to read overlay PDF page {page_number + 1}: {exc}")
@@ -230,14 +240,14 @@ class YandexOCRAsync:
         return output.getvalue()
 
     # =========================
-    # OCR API
+    # OCR API with JSON Lines support
     # =========================
 
     async def recognize_pdf(
         self,
         session: aiohttp.ClientSession,
         pdf_bytes: bytes,
-        max_retries: int = 5,
+        max_retries: int = 10,
         base_delay: float = 2.0,
     ) -> Optional[str]:
         body = {
@@ -259,62 +269,34 @@ class YandexOCRAsync:
                     if response.status == 200:
                         data = await response.json()
                         operation_id = data.get("id")
-                        if not operation_id:
-                            print(f"[recognize_pdf] No operation id, attempt {attempt}")
-                            return None
                         return operation_id
 
                     response_text = await response.text()
 
                     if response.status in {429, 500, 502, 503, 504}:
-                        print(
-                            f"[recognize_pdf] Temporary HTTP error {response.status}, "
-                            f"attempt {attempt}/{max_retries}: {response_text}"
-                        )
+                        print(f"attempt {attempt}/{max_retries}: {response_text}")
                     else:
-                        print(
-                            f"[recognize_pdf] Permanent HTTP error {response.status}: {response_text}"
-                        )
+                        print(f"Permanent HTTP error {response.status}: {response_text}")
                         return None
 
-            except ConnectionTimeoutError as exc:
-                print(
-                    f"[recognize_pdf] Connection timeout, "
-                    f"attempt {attempt}/{max_retries}: {exc}"
-                )
-
-            except asyncio.TimeoutError as exc:
-                print(
-                    f"[recognize_pdf] Async timeout, "
-                    f"attempt {attempt}/{max_retries}: {exc}"
-                )
-
-            except ClientError as exc:
-                print(
-                    f"[recognize_pdf] Client error, "
-                    f"attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}"
-                )
-
+            except (ConnectionTimeoutError, asyncio.TimeoutError, ClientError) as exc:
+                print(f"attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}")
             except Exception as exc:
-                print(
-                    f"[recognize_pdf] Unexpected error, "
-                    f"attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}"
-                )
+                print(f"attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}")
 
             if attempt < max_retries:
-                sleep_time = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                sleep_time = base_delay + random.uniform(0, 1)
                 await asyncio.sleep(sleep_time)
 
-        print("[recognize_pdf] Failed after all retries")
+        print("Failed after all retries")
         return None
-
 
     async def get_operation_result(
         self,
         session: aiohttp.ClientSession,
         operation_id: str,
-        max_retries: int = 5,
-        delay: int = 5,
+        max_retries: int = 30,
+        delay: int = 3,
     ) -> Optional[Dict[str, Any]]:
         url = self.OCR_RESULT_URL.format(operation_id=operation_id)
 
@@ -322,18 +304,42 @@ class YandexOCRAsync:
             try:
                 async with session.get(url, headers=self.headers) as response:
                     if response.status == 200:
-                        return await response.json()
+                        text = await response.text()
+                        
+                        results = []
+                        for line in text.strip().split('\n'):
+                            if line.strip():
+                                try:
+                                    results.append(json.loads(line))
+                                except json.JSONDecodeError:
+                                    continue
+                        
+                        if not results:
+                            await asyncio.sleep(delay)
+                            continue
+                        
+                        if len(results) == 1:
+                            return results[0]
+                        else:
+                            combined = {"result": {"pages": []}}
+                            for r in results:
+                                if "result" in r:
+                                    if "pages" in r["result"]:
+                                        combined["result"]["pages"].extend(r["result"]["pages"])
+                                    else:
+                                        combined["result"]["pages"].append(r["result"])
+                            return combined
 
                     if response.status == 404:
                         await asyncio.sleep(delay)
                         continue
 
-                    print(f"Failed to get result: {response.status} - {await response.text()}")
+                    print(f"Failed to get result: {response.status}")
+                    await asyncio.sleep(delay)
 
             except Exception as exc:
                 print(f"Error while polling OCR result: {exc}")
-
-            await asyncio.sleep(delay)
+                await asyncio.sleep(delay)
 
         print(f"Operation timed out after {max_retries * delay} seconds")
         return None
@@ -392,45 +398,104 @@ class YandexOCRAsync:
             {"ocr_width": ocr_width, "ocr_height": ocr_height},
         )
 
+    def parse_multi_page_result(
+        self,
+        ocr_result: Optional[Dict[str, Any]],
+    ) -> List[Tuple[str, List[Dict[str, float | str]], Dict[str, float]]]:
+        if not ocr_result or "result" not in ocr_result:
+            return []
+
+        result = ocr_result["result"]
+        
+        if "pages" in result:
+            pages = result["pages"]
+        else:
+            pages = [result]
+        
+        parsed_pages = []
+        
+        for page in pages:
+            single_page_result = {"result": page}
+            text, text_blocks, dimensions = self.extract_text_from_result(single_page_result)
+            parsed_pages.append((text, text_blocks, dimensions))
+        
+        return parsed_pages
+
     # =========================
-    # PDF processing in memory
+    # PDF processing - convert to image-only (removes original text)
     # =========================
 
     @staticmethod
-    def pdf_to_image_only_pdf(input_pdf_bytes: bytes, dpi: int = 300) -> bytes:
+    def pdf_to_image_only_pdf(input_pdf_bytes: bytes, dpi: int = 200, quality: int = 100) -> bytes:
         """
-        Convert PDF bytes to image-only PDF bytes
+        Convert PDF to image-only PDF with JPEG compression for smaller size
         """
         src = fitz.open(stream=input_pdf_bytes, filetype="pdf")
-        out = fitz.open()
-
+        
         try:
+            has_text = False
+            for page in src:
+                text = page.get_text()
+                if text and len(text.strip()) > 50:
+                    has_text = True
+                    break
+            
+            if not has_text:
+                return src.tobytes(garbage=4, deflate=True, clean=True)
+            
             zoom = dpi / 72.0
             matrix = fitz.Matrix(zoom, zoom)
-
+            
+            out = fitz.open()
+            
             for page in src:
                 pix = page.get_pixmap(matrix=matrix, alpha=False)
+                png_data = pix.tobytes("png")
+                
+                from PIL import Image
+                import io
+                
+                img = Image.open(io.BytesIO(png_data))
+                if img.mode == 'RGBA':
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    background.paste(img, mask=img.split()[3])
+                    img = background
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                jpeg_buffer = io.BytesIO()
+                img.save(jpeg_buffer, format='JPEG', quality=quality, optimize=True)
+                img_data = jpeg_buffer.getvalue()
+                
                 new_page = out.new_page(width=page.rect.width, height=page.rect.height)
-                new_page.insert_image(page.rect, stream=pix.tobytes("png"))
-
-            return out.tobytes()
+                
+                new_page.insert_image(
+                    page.rect, 
+                    stream=img_data,
+                    keep_proportion=True
+                )
+            
+            return out.tobytes(garbage=4, deflate=True, clean=True)
+            
         finally:
-            out.close()
             src.close()
-
+    
     def create_text_overlay_pdf(
         self,
         original_pdf_bytes: bytes,
         text_blocks: List[Dict[str, float | str]],
         ocr_page_dim: Dict[str, float],
+        quality: int = 100,
     ) -> bytes:
         """
-        Create PDF bytes with invisible text layer over original page
+        Create PDF with image background (JPEG compressed) + invisible text overlay
         """
         if not text_blocks:
             return original_pdf_bytes
 
-        reader = PdfReader(io.BytesIO(original_pdf_bytes))
+        image_pdf_bytes = self.pdf_to_image_only_pdf(original_pdf_bytes, dpi=200, quality=quality)
+        
+        reader = PdfReader(io.BytesIO(image_pdf_bytes))
         writer = PdfWriter()
         page = reader.pages[0]
 
@@ -444,7 +509,7 @@ class YandexOCRAsync:
         ocr_height = float(ocr_page_dim.get("ocr_height", 0.0))
 
         if ocr_width <= 0 or ocr_height <= 0:
-            return original_pdf_bytes
+            return image_pdf_bytes
 
         scale_x = pdf_width / ocr_width
         scale_y = pdf_height / ocr_height
@@ -495,105 +560,102 @@ class YandexOCRAsync:
 
         output = io.BytesIO()
         writer.write(output)
-        return output.getvalue()
+        
+        result_bytes = output.getvalue()
+        
+        try:
+            doc = fitz.open(stream=result_bytes, filetype="pdf")
+            compressed = doc.tobytes(garbage=4, deflate=True, clean=True)
+            doc.close()
+            return compressed
+        except:
+            return result_bytes
 
     # =========================
-    # Page processing
+    # Batch processing
     # =========================
 
-    async def process_chunk(
+    async def process_batch(
         self,
         session: aiohttp.ClientSession,
-        chunk_s3_key: str,
-        page_number: int,
+        batch_s3_key: str,
+        page_numbers: List[int],
+        batch_id: int,
         semaphore: asyncio.Semaphore,
-    ) -> Optional[Dict[str, int]]:
+    ) -> None:
         async with semaphore:
-            image_s3_key = self._tmp_image_s3_key(page_number)
-            overlay_s3_key = self._tmp_overlay_pdf_s3_key(page_number)
-
             try:
-                chunk_bytes = self.download_bytes_from_s3(chunk_s3_key)
-
-                # Сильно уменьшает размер и количество таймаутов
-                image_pdf_bytes = self.pdf_to_image_only_pdf(chunk_bytes, dpi=100)
-
-                print(
-                    f"Page {page_number + 1}: image PDF size = "
-                    f"{len(image_pdf_bytes) / 1024 / 1024:.2f} MB"
-                )
-
-                self.upload_bytes_to_s3(
-                    image_pdf_bytes,
-                    image_s3_key,
-                    content_type="application/pdf",
-                )
+                batch_bytes = self.download_bytes_from_s3(batch_s3_key)
+                
+                image_pdf_bytes = self.pdf_to_image_only_pdf(batch_bytes, dpi=200, quality=100)
 
                 operation_id = await self.recognize_pdf(session, image_pdf_bytes)
-
+                
                 if not operation_id:
-                    print(f"OCR start failed for page {page_number + 1}")
-                    self.save_page_text(page_number, "")
-                    self.save_page_json(page_number, "")
-                    self.upload_bytes_to_s3(
-                        image_pdf_bytes,
-                        overlay_s3_key,
-                        content_type="application/pdf",
-                    )
-                    return None
-
+                    print(f"OCR start failed for batch {batch_id}")
+                    for page_num in page_numbers:
+                        self.save_page_text(page_num, "")
+                        self.save_page_json(page_num, "")
+                    return
+                
                 ocr_result = await self.get_operation_result(
                     session=session,
                     operation_id=operation_id,
-                    max_retries=10,
+                    max_retries=30,
                     delay=3,
                 )
-
+                
                 if not ocr_result:
-                    print(f"OCR result failed for page {page_number + 1}")
-                    self.save_page_text(page_number, "")
-                    self.save_page_json(page_number, "")
+                    print(f"OCR result failed for batch {batch_id}")
+                    for page_num in page_numbers:
+                        self.save_page_text(page_num, "")
+                        self.save_page_json(page_num, "")
+                    return
+                
+                parsed_pages = self.parse_multi_page_result(ocr_result)
+                
+                for idx, page_num in enumerate(page_numbers):
+                    if idx >= len(parsed_pages):
+                        print(f"Warning: Batch {batch_id} missing page {idx}")
+                        self.save_page_text(page_num, "")
+                        self.save_page_json(page_num, "")
+                        continue
+                    
+                    text, text_blocks, ocr_page_dim = parsed_pages[idx]
+                    
+                    self.save_page_text(page_num, text)
+                    self.save_page_json(page_num, text)
+                    
+                    single_page_bytes = self.extract_single_page(batch_bytes, idx)
+                    
+                    overlay_pdf_bytes = self.create_text_overlay_pdf(
+                        original_pdf_bytes=single_page_bytes,
+                        text_blocks=text_blocks,
+                        ocr_page_dim=ocr_page_dim,
+                        quality=100,
+                    )
+                    
                     self.upload_bytes_to_s3(
-                        image_pdf_bytes,
-                        overlay_s3_key,
+                        overlay_pdf_bytes,
+                        self._tmp_overlay_pdf_s3_key(page_num),
                         content_type="application/pdf",
                     )
-                    return None
-
-                text, text_blocks, ocr_page_dim = self.extract_text_from_result(ocr_result)
-
-                self.save_page_text(page_number, text)
-                self.save_page_json(page_number, text)
-
-                overlay_pdf_bytes = self.create_text_overlay_pdf(
-                    original_pdf_bytes=image_pdf_bytes,
-                    text_blocks=text_blocks,
-                    ocr_page_dim=ocr_page_dim,
-                )
-
-                self.upload_bytes_to_s3(
-                    overlay_pdf_bytes,
-                    overlay_s3_key,
-                    content_type="application/pdf",
-                )
-
-                return {"page": page_number + 1}
-
+                    
+                    print(f"Processed page {page_num + 1} from batch {batch_id}")
+                
             except Exception as exc:
-                print(f"[process_chunk] Page {page_number + 1} failed: {type(exc).__name__}: {exc}")
-
-                try:
-                    self.save_page_text(page_number, "")
-                    self.save_page_json(page_number, "")
-                except Exception as save_exc:
-                    print(f"[process_chunk] Failed to save empty result for page {page_number + 1}: {save_exc}")
-
-                return None
-
+                print(f"Batch {batch_id} failed: {type(exc).__name__}: {exc}")
+                import traceback
+                traceback.print_exc()
+                for page_num in page_numbers:
+                    try:
+                        self.save_page_text(page_num, "")
+                        self.save_page_json(page_num, "")
+                    except Exception as save_exc:
+                        print(f"Failed to save empty result for page {page_num + 1}: {save_exc}")
+            
             finally:
-                self.delete_s3_object(chunk_s3_key)
-                self.delete_s3_object(image_s3_key)
-
+                self.delete_s3_object(batch_s3_key)
 
     # =========================
     # Full document processing
@@ -602,11 +664,15 @@ class YandexOCRAsync:
     async def process_pdf(
         self,
         input_pdf_bytes: bytes,
-        max_concurrent: int = 1,
+        max_concurrent: int = 10,
+        batch_size: int = 3,
         cleanup_tmp_s3: bool = False,
     ) -> None:
-        chunks = self.split_pdf(input_pdf_bytes)
+        batches = self.split_pdf_to_batches(input_pdf_bytes, batch_size=batch_size)
         semaphore = asyncio.Semaphore(max_concurrent)
+        
+        total_pages = sum(len(page_numbers) for _, page_numbers, _ in batches)
+        print(f"Split into {len(batches)} batches, total {total_pages} pages")
 
         timeout = ClientTimeout(
             total=600,
@@ -623,18 +689,12 @@ class YandexOCRAsync:
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             tasks = [
                 asyncio.create_task(
-                    self.process_chunk(session, chunk_s3_key, page_number, semaphore)
+                    self.process_batch(session, batch_key, page_numbers, batch_id, semaphore)
                 )
-                for chunk_s3_key, page_number in chunks
+                for batch_key, page_numbers, batch_id in batches
             ]
-
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for idx, result in enumerate(results):
-                if isinstance(result, Exception):
-                    print(f"[process_pdf] Task for page {idx + 1} crashed: {result}")
-
-        total_pages = len(chunks)
+            
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         print("Starting final merge...")
 
