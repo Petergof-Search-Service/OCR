@@ -1,0 +1,35 @@
+{
+  "dataset_dir": "/home/kataev-ivan/museum_ocr/metrics_well/dataset",
+  "files": [
+    {
+      "source_file": "/home/kataev-ivan/museum_ocr/metrics_well/dataset/191aadf8ecf880202e5fcd351937c7a2.json",
+      "upload_name": "191aadf8ecf880202e5fcd351937c7a2.chunks.jsonl",
+      "file_id": "fvt798n46uqm7df4fvcp",
+      "chunks_count": 4556
+    },
+    {
+      "source_file": "/home/kataev-ivan/museum_ocr/metrics_well/dataset/1faa38018bd3ef0b4c0389a171f8f2e7.json",
+      "upload_name": "1faa38018bd3ef0b4c0389a171f8f2e7.chunks.jsonl",
+      "file_id": "fvts6t4j6k65me2jv06s",
+      "chunks_count": 3727
+    },
+    {
+      "source_file": "/home/kataev-ivan/museum_ocr/metrics_well/dataset/33dbe9a3946631a30d6c78060daae81c.json",
+      "upload_name": "33dbe9a3946631a30d6c78060daae81c.chunks.jsonl",
+      "file_id": "fvtk7h0qnlut334dtun0",
+      "chunks_count": 1495
+    },
+    {
+      "source_file": "/home/kataev-ivan/museum_ocr/metrics_well/dataset/7-й_Конгресс_18.05.json",
+      "upload_name": "7-й_Конгресс_18.05.chunks.jsonl",
+      "file_id": "fvt006aormomremvhhl7",
+      "chunks_count": 1747
+    },
+    {
+      "source_file": "/home/kataev-ivan/museum_ocr/metrics_well/dataset/7-й_Конгресс_18мая.json",
+      "upload_name": "7-й_Конгресс_18мая.chunks.jsonl",
+      "file_id": "fvtlbjo77l4pttj37124",
+      "chunks_count": 1930
+    }
+  ]
+}

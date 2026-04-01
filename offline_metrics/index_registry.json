@@ -1,0 +1,9 @@
+[
+  {
+    "dataset_dir": "/home/kataev-ivan/museum_ocr/metrics_well/dataset",
+    "manifest": "/home/kataev-ivan/museum_ocr/metrics_well/uploaded_files.json",
+    "name": "full_index",
+    "vector_store_id": "fvto5ibso3o1sfh94ueq",
+    "status": "completed"
+  }
+]
