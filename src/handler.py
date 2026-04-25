@@ -24,14 +24,20 @@ from config import (
 
 def _patch_status(key: str, status: str, error: str | None = None) -> None:
     if not API_BASE_URL or not CLOUD_FUNCTION_API_KEY:
+        print("_patch_status: API_BASE_URL or CLOUD_FUNCTION_API_KEY is not configured, skipping")
         return
+    url = f"{API_BASE_URL}/files/by-key/status"
     try:
-        requests.patch(
-            f"{API_BASE_URL}/files/by-key/status",
+        resp = requests.patch(
+            url,
             json={"system_key": key, "status": status, "error_message": error},
             headers={"x-service-key": CLOUD_FUNCTION_API_KEY},
             timeout=10,
         )
+        if resp.status_code >= 400:
+            print(f"_patch_status: {url} status={status} -> HTTP {resp.status_code} body={resp.text[:300]}")
+        else:
+            print(f"_patch_status: {url} status={status} -> HTTP {resp.status_code}")
     except Exception as e:
         print(f"_patch_status error: {e}")
 
