@@ -104,6 +104,36 @@ ruff check src
   (нет файла → no-op) и удобно для локальной разработки; функц-env он не перетирает.
 - CI публикует только версии. Сами функции и bucket-триггеры созданы один раз вручную (см. README).
 
+## Rate-limiting OCR API и масштабирование (важно)
+
+OCR API (`recognizeTextAsync`/`getRecognition`) имеет квоту RPS на каталог. Под нагрузкой
+ловили **тысячи 429** на поллинге → потерянные страницы. Защита — в два слоя:
+
+1. **Per-file (в коде):** общий async token-bucket `OCR_MAX_RPS` (дефолт 8) на отправку+поллинг
+   + экспоненциальный backoff с `Retry-After` (`recognize_pdf`, `get_operation_result`). Ограничивает
+   RPS **одного инстанса** (= одного файла), чтобы большой документ сам себя не заддосил.
+2. **Глобально (инфра):** `OCR_MAX_RPS` НЕ координирует разные инстансы — каждый файл это отдельный
+   вызов функции. Поэтому стоит **scaling policy** `zone-instances-limit=2` на теге `$latest`
+   (`yc serverless function set-scaling-policy`). Сеть на 3 подсетях/зонах ⇒ одновременно ≤ `3·2=6`
+   инстансов ⇒ пик глобального RPS ≈ `6 · OCR_MAX_RPS`.
+
+**Тюнинг:** ориентир — лог `Pages summary: total/ok/failed` и число `Failed to get result: 429`.
+Много 429/таймаутов → снижай `OCR_MAX_RPS` или `zone-instances-limit`. Мало и медленно → повышай.
+Два регулятора: `zone-instances-limit` (параллельность файлов) и `OCR_MAX_RPS` (нагрузка на файл).
+
+⚠️ **Кап инстансов может ронять события триггера.** При упоре в лимит часть вызовов от bucket-триггера
+не обработается; у прод-триггера `retry_attempts=1`, поэтому файл рискует застрять в `uploaded`
+(watchdog потом пометит `dead`). Если поднимаешь параллельную загрузку — увеличь `retry_attempts`
+триггера или подними `zone-instances-limit`. Альтернатива жёсткому глобальному лимиту без потери
+параллельности — распределённый лимитер (YDB Coordination/Redis), но это +инфра (пока не делаем).
+
+Политика масштабирования — на уровне функции (не версии), переживает деплои:
+```bash
+yc serverless function set-scaling-policy --id <fn-id> --folder-id <folder> --profile <prof> \
+  --tag '$latest' --zone-instances-limit 2
+yc serverless function list-scaling-policies --id <fn-id> --folder-id <folder> --profile <prof>
+```
+
 ## Yandex Cloud (инфраструктура и доступы)
 
 **Два независимых окружения — два разных облака/каталога.** В каждом своя функция, свой триггер,
