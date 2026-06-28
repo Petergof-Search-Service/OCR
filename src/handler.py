@@ -35,7 +35,10 @@ def _patch_status(key: str, status: str, error: str | None = None) -> None:
             timeout=10,
         )
         if resp.status_code >= 400:
-            print(f"_patch_status: {url} status={status} -> HTTP {resp.status_code} body={resp.text[:300]}")
+            print(
+                f"_patch_status: {url} status={status} -> "
+                f"HTTP {resp.status_code} body={resp.text[:300]}"
+            )
         else:
             print(f"_patch_status: {url} status={status} -> HTTP {resp.status_code}")
     except Exception as e:

@@ -6,7 +6,7 @@ import random
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import aiohttp
 import fitz
@@ -115,6 +115,9 @@ class YandexOCRAsync:
     def _json_result_path(self) -> Path:
         return self.result_json_dir / f"{self.base_name}.json"
 
+    def _json_tmp_path(self) -> Path:
+        return self.tmp_dir / f"{self.base_name}.json"
+
     def _pdf_result_path(self) -> Path:
         return self.result_pdf_dir / f"{self.base_name}.pdf"
 
@@ -163,7 +166,7 @@ class YandexOCRAsync:
         with self._txt_result_path().open("w", encoding="utf-8"):
             pass
 
-        with self._json_result_path().open("w", encoding="utf-8") as out:
+        with self._json_tmp_path().open("w", encoding="utf-8") as out:
             out.write('{"data":[\n')
 
         self._final_json_first_item = True
@@ -175,10 +178,14 @@ class YandexOCRAsync:
         if not self._final_json_initialized or self._final_json_finalized:
             return
 
-        with self._json_result_path().open("a", encoding="utf-8") as out:
+        with self._json_tmp_path().open("a", encoding="utf-8") as out:
             out.write('\n]}\n')
 
         self._final_json_finalized = True
+
+        self._json_result_path().parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(self._json_tmp_path()), str(self._json_result_path()))
+
         print(
             f"Saved final JSON: {self._json_result_path()} "
             f"(pages: {self._final_json_pages_written})"
@@ -194,10 +201,12 @@ class YandexOCRAsync:
             encoding="utf-8",
         )
 
-    def split_pdf_to_chunks(self, input_pdf_path: Path, chunk_size: int = 50) -> List[Tuple[int, Path, List[int]]]:
+    def split_pdf_to_chunks(
+        self, input_pdf_path: Path, chunk_size: int = 50
+    ) -> list[tuple[int, Path, list[int]]]:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be > 0")
-        chunks: List[Tuple[int, Path, List[int]]] = []
+        chunks: list[tuple[int, Path, list[int]]] = []
         with input_pdf_path.open("rb") as src:
             reader = PdfReader(src)
             total_pages = len(reader.pages)
@@ -217,12 +226,12 @@ class YandexOCRAsync:
         self,
         chunk_id: int,
         chunk_pdf_path: Path,
-        global_page_numbers: List[int],
+        global_page_numbers: list[int],
         batch_size: int = 1,
-    ) -> List[Tuple[Path, List[int], int]]:
+    ) -> list[tuple[Path, list[int], int]]:
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0")
-        batches: List[Tuple[Path, List[int], int]] = []
+        batches: list[tuple[Path, list[int], int]] = []
         with chunk_pdf_path.open("rb") as src:
             reader = PdfReader(src)
             total_pages = len(reader.pages)
@@ -244,12 +253,12 @@ class YandexOCRAsync:
         batch_pdf_path: Path,
         chunk_id: int,
         batch_id: int,
-        page_numbers: List[int],
-    ) -> Tuple[Path, List[Path]]:
+        page_numbers: list[int],
+    ) -> tuple[Path, list[Path]]:
         zoom = self.dpi / 72.0
         matrix = fitz.Matrix(zoom, zoom)
         batch_output = fitz.open()
-        per_page_paths: List[Path] = []
+        per_page_paths: list[Path] = []
         src = fitz.open(batch_pdf_path)
         try:
             for local_index, page in enumerate(src):
@@ -277,7 +286,9 @@ class YandexOCRAsync:
                 page_rect = page.rect
                 single_doc = fitz.open()
                 try:
-                    single_page = single_doc.new_page(width=page_rect.width, height=page_rect.height)
+                    single_page = single_doc.new_page(
+                        width=page_rect.width, height=page_rect.height
+                    )
                     single_page.insert_image(page_rect, stream=jpeg_bytes, keep_proportion=True)
                     single_bytes = single_doc.tobytes(garbage=4, deflate=True, clean=True)
                 finally:
@@ -310,7 +321,7 @@ class YandexOCRAsync:
         pdf_bytes: bytes,
         max_retries: int = 10,
         base_delay: float = 2.0,
-    ) -> Optional[str]:
+    ) -> str | None:
         body = {
             "mimeType": "application/pdf",
             "languageCodes": ["*"],
@@ -320,7 +331,9 @@ class YandexOCRAsync:
         headers = {**self.headers, "Content-Type": "application/json"}
         for attempt in range(1, max_retries + 1):
             try:
-                async with session.post(self.OCR_RECOGNIZE_URL, headers=headers, json=body) as response:
+                async with session.post(
+                    self.OCR_RECOGNIZE_URL, headers=headers, json=body
+                ) as response:
                     if response.status == 200:
                         data = await response.json()
                         return data.get("id")
@@ -346,7 +359,7 @@ class YandexOCRAsync:
         operation_id: str,
         max_retries: int = 30,
         delay: int = 3,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         import asyncio
 
         url = self.OCR_RESULT_URL.format(operation_id=operation_id)
@@ -389,8 +402,8 @@ class YandexOCRAsync:
 
     def extract_text_from_result(
         self,
-        ocr_result: Optional[Dict[str, Any]],
-    ) -> Tuple[str, List[Dict[str, float | str]], Dict[str, float]]:
+        ocr_result: dict[str, Any] | None,
+    ) -> tuple[str, list[dict[str, float | str]], dict[str, float]]:
         if not ocr_result or "result" not in ocr_result:
             return "", [], {"ocr_width": 0.0, "ocr_height": 0.0}
         result = ocr_result["result"]
@@ -398,8 +411,8 @@ class YandexOCRAsync:
         ocr_width = float(text_annotation.get("width", 0.0))
         ocr_height = float(text_annotation.get("height", 0.0))
 
-        full_text: List[str] = []
-        text_blocks: List[Dict[str, float | str]] = []
+        full_text: list[str] = []
+        text_blocks: list[dict[str, float | str]] = []
         for block in text_annotation.get("blocks", []):
             for line in block.get("lines", []):
                 text = line.get("text")
@@ -426,8 +439,8 @@ class YandexOCRAsync:
 
     def parse_multi_page_result(
         self,
-        ocr_result: Optional[Dict[str, Any]],
-    ) -> List[Tuple[str, List[Dict[str, float | str]], Dict[str, float]]]:
+        ocr_result: dict[str, Any] | None,
+    ) -> list[tuple[str, list[dict[str, float | str]], dict[str, float]]]:
         if not ocr_result or "result" not in ocr_result:
             return []
         result = ocr_result["result"]
@@ -437,8 +450,8 @@ class YandexOCRAsync:
     def create_text_overlay_pdf(
         self,
         image_only_pdf_bytes: bytes,
-        text_blocks: List[Dict[str, float | str]],
-        ocr_page_dim: Dict[str, float],
+        text_blocks: list[dict[str, float | str]],
+        ocr_page_dim: dict[str, float],
     ) -> bytes:
         reader = PdfReader(io.BytesIO(image_only_pdf_bytes))
         writer = PdfWriter()
@@ -514,11 +527,11 @@ class YandexOCRAsync:
         session: aiohttp.ClientSession,
         chunk_id: int,
         batch_path: Path,
-        page_numbers: List[int],
+        page_numbers: list[int],
         batch_id: int,
     ) -> None:
-        image_batch_path: Optional[Path] = None
-        image_page_paths: List[Path] = []
+        image_batch_path: Path | None = None
+        image_page_paths: list[Path] = []
         try:
             image_batch_path, image_page_paths = self.render_batch_to_image_pdfs(
                 batch_pdf_path=batch_path,
@@ -572,7 +585,9 @@ class YandexOCRAsync:
                         text_blocks,
                         ocr_page_dim,
                     )
-                    self.write_bytes(self._chunk_overlay_pdf_path(chunk_id, page_num), overlay_pdf_bytes)
+                    self.write_bytes(
+                        self._chunk_overlay_pdf_path(chunk_id, page_num), overlay_pdf_bytes
+                    )
                 finally:
                     del image_single_page_bytes
                     gc.collect()
@@ -603,7 +618,7 @@ class YandexOCRAsync:
                 self.remove_file(image_page_path)
             gc.collect()
 
-    def build_chunk_outputs(self, chunk_id: int, page_numbers: List[int]) -> None:
+    def build_chunk_outputs(self, chunk_id: int, page_numbers: list[int]) -> None:
         with self._chunk_txt_result_path(chunk_id).open("w", encoding="utf-8") as txt_out:
             for idx, page_number in enumerate(page_numbers):
                 page_path = self._chunk_page_txt_path(chunk_id, page_number)
@@ -618,7 +633,9 @@ class YandexOCRAsync:
                 if page_path.exists():
                     jsonl_out.write(page_path.read_text(encoding="utf-8").strip())
                 else:
-                    jsonl_out.write(json.dumps({"page": page_number + 1, "text": ""}, ensure_ascii=False))
+                    jsonl_out.write(
+                        json.dumps({"page": page_number + 1, "text": ""}, ensure_ascii=False)
+                    )
                 jsonl_out.write("\n")
 
         chunk_pdf_path = self._chunk_pdf_result_path(chunk_id)
@@ -653,10 +670,10 @@ class YandexOCRAsync:
 
     def append_chunk_txt_to_final(self, chunk_id: int, is_first_chunk: bool) -> None:
         mode = "a" if self._txt_result_path().exists() else "w"
-        with self._chunk_txt_result_path(chunk_id).open("r", encoding="utf-8") as src, self._txt_result_path().open(
-            mode,
-            encoding="utf-8",
-        ) as dst:
+        with (
+            self._chunk_txt_result_path(chunk_id).open("r", encoding="utf-8") as src,
+            self._txt_result_path().open(mode, encoding="utf-8") as dst,
+        ):
             if not is_first_chunk:
                 dst.write("\n\n")
             dst.write(src.read())
@@ -667,7 +684,10 @@ class YandexOCRAsync:
             print(f"Chunk JSONL does not exist: {jsonl_path}")
             return
 
-        with jsonl_path.open("r", encoding="utf-8") as src, self._json_result_path().open("a", encoding="utf-8") as dst:
+        with (
+            jsonl_path.open("r", encoding="utf-8") as src,
+            self._json_tmp_path().open("a", encoding="utf-8") as dst,
+        ):
             for line_number, line in enumerate(src, start=1):
                 line = line.strip()
                 if not line:
@@ -690,7 +710,7 @@ class YandexOCRAsync:
                 self._final_json_pages_written += 1
 
 
-    def _run_pdf_merge_tool(self, input_paths: List[Path], output_path: Path) -> str:
+    def _run_pdf_merge_tool(self, input_paths: list[Path], output_path: Path) -> str:
         if not input_paths:
             raise ValueError("input_paths is empty")
 
@@ -704,7 +724,14 @@ class YandexOCRAsync:
 
         qpdf_path = shutil.which("qpdf")
         if qpdf_path:
-            cmd = [qpdf_path, "--empty", "--pages", *[str(p) for p in input_paths], "--", str(output_path)]
+            cmd = [
+                qpdf_path,
+                "--empty",
+                "--pages",
+                *[str(p) for p in input_paths],
+                "--",
+                str(output_path),
+            ]
             subprocess.run(cmd, check=True)
             return "qpdf"
 
@@ -726,7 +753,7 @@ class YandexOCRAsync:
 
     def _merge_pdf_files_tree(
         self,
-        input_paths: List[Path],
+        input_paths: list[Path],
         output_path: Path,
         fan_in: int = 4,
     ) -> None:
@@ -741,7 +768,7 @@ class YandexOCRAsync:
         round_index = 0
 
         while len(current_paths) > 1:
-            next_paths: List[Path] = []
+            next_paths: list[Path] = []
             print(
                 f"Final PDF merge round {round_index}: "
                 f"{len(current_paths)} files, fan_in={fan_in}"
@@ -787,7 +814,7 @@ class YandexOCRAsync:
         final_candidate.replace(output_path)
         print(f"Saved final PDF: {output_path}")
 
-    def build_final_pdf_from_chunks(self, chunk_ids: List[int]) -> None:
+    def build_final_pdf_from_chunks(self, chunk_ids: list[int]) -> None:
         output_path = self._pdf_result_path()
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -812,7 +839,7 @@ class YandexOCRAsync:
         session: aiohttp.ClientSession,
         chunk_id: int,
         chunk_pdf_path: Path,
-        page_numbers: List[int],
+        page_numbers: list[int],
         max_concurrent: int,
         batch_size: int,
     ) -> None:
@@ -830,7 +857,7 @@ class YandexOCRAsync:
 
             semaphore = asyncio.Semaphore(effective_parallel_batches)
 
-            async def _run(batch_path: Path, pages: List[int], batch_id: int) -> None:
+            async def _run(batch_path: Path, pages: list[int], batch_id: int) -> None:
                 async with semaphore:
                     await self.process_batch(session, chunk_id, batch_path, pages, batch_id)
 
@@ -864,7 +891,7 @@ class YandexOCRAsync:
         print(f"Split into {len(chunks)} chunks")
         timeout = ClientTimeout(total=600, connect=120, sock_connect=120, sock_read=300)
         connector = TCPConnector(limit=max(1, max_concurrent), ttl_dns_cache=300)
-        processed_chunk_ids: List[int] = []
+        processed_chunk_ids: list[int] = []
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
