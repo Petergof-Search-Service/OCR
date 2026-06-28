@@ -94,13 +94,16 @@ Test и prod живут в **разных облаках/каталогах** Ya
 - **Pull request** → деплой новой версии `ocr-processing` в **testing**-каталог.
 - **Мерж в `main`** → деплой новой версии `ocr-processing` в **prod**-каталог.
 
-Деплой — экшеном [`yc-actions/yc-sls-function`](https://github.com/yc-actions/yc-sls-function):
-рантайм `python314`, `memory 2048Mb`, `execution-timeout 3600`, `source-root: ./src`,
-`service-account: petergof-robot`.
+Деплой выполняется **напрямую через `yc` CLI** ([`.github/deploy.sh`](.github/deploy.sh)):
+рантайм `python314`, `memory 2GB`, `execution-timeout 3600s`, `concurrency 1`,
+`service-account-id` своего окружения. Готовый экшен
+[`yc-actions/yc-sls-function`](https://github.com/yc-actions/yc-sls-function) **не используется**,
+потому что не умеет монтировать бакет (`mounts`), а без него OCR не видит входной файл.
 
-> ⚠️ Каждая версия YC-функции — **полная спека**. Монтирование бакета (`mounts`) и `environment`
-> задаются в каждом деплое; иначе новая версия потеряет доступ к бакету. Поэтому они прописаны
-> прямо в `ci.yml`.
+> ⚠️ Каждая версия YC-функции — **полная спека**. Монтирование бакета (`--mount`), VPC
+> (`--network-id`), `--environment` и `--service-account-id` задаются в каждом деплое; иначе новая
+> версия потеряет эти настройки. Переменные окружения выставляются на уровне версии функции (как
+> в watchdog), а не из `.env` в коде.
 
 ### Окружения
 

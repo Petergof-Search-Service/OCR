@@ -64,11 +64,19 @@ ruff check src
 
 - CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Test и prod — **разные
   облака/каталоги** YC; функция в обоих зовётся `ocr-processing`. PR → деплой в testing-каталог;
-  мерж в `main` → деплой в prod-каталог. Экшен `yc-actions/yc-sls-function@v3`,
-  `source-root: ./src`, рантайм `python314`, `memory 2048Mb`, `execution-timeout 3600`.
-- ⚠️ **Каждая версия YC-функции — полная спека.** `mounts` и `environment` задаются в КАЖДОМ
-  деплое. Забудешь `mounts` — новая версия потеряет монтирование бакета, и функция перестанет
-  видеть входной файл. Это главное отличие от watchdog (там монтирования нет).
+  мерж в `main` → деплой в prod-каталог. Рантайм `python314`, `memory 2GB`,
+  `execution-timeout 3600s`, `concurrency 1`.
+- **Деплой — напрямую через `yc` CLI** ([`.github/deploy.sh`](.github/deploy.sh)), НЕ через
+  экшен `yc-actions/yc-sls-function`: тот экшен **не поддерживает вход `mounts`** (нет в списке
+  валидных инпутов), а OCR без смонтированного бакета не работает. Скрипт ставит yc CLI,
+  логинится по SA-ключу, зипует `src/` и зовёт `yc serverless function version create`.
+- ⚠️ **Каждая версия YC-функции — полная спека.** `--mount`, `--network-id`, `--environment`,
+  `--service-account-id`, `--concurrency` задаются в КАЖДОМ деплое. Забудешь `--mount` — новая
+  версия потеряет монтирование бакета, и функция перестанет видеть входной файл. Это главное
+  отличие от watchdog (там нет ни монтирования, ни VPC).
+- `environment` выставляется **на уровне версии функции** (как в watchdog), а не из забандленного
+  `.env` (в `src/` его нет). `config.py` всё равно вызывает `load_dotenv()` — это безвредно
+  (нет файла → no-op) и удобно для локальной разработки; функц-env он не перетирает.
 - CI публикует только версии. Сами функции и bucket-триггеры созданы один раз вручную (см. README).
 
 ## Yandex Cloud (инфраструктура и доступы)
@@ -138,8 +146,8 @@ yc storage s3api list-objects --bucket <bucket> --prefix result/  --profile <pro
   `CLOUD_FUNCTION_API_KEY` (**org-секрет**; visibility должен включать этот репозиторий, иначе
   приедет пустым и YC упадёт с `Illegal value of environment variable`).
 - Variables (`vars.`): `API_BASE_URL_TEST`/`_PROD`.
-- Бакеты, точки монтирования, `FOLDER_ID` и `INPUT_PREFIX` зашиты прямо в `ci.yml` (стабильная
-  инфраструктура).
+- Бакеты, точки монтирования, SA-id, network-id, `FOLDER_ID` и `INPUT_PREFIX` зашиты прямо в
+  `ci.yml`/`deploy.sh` (стабильная инфраструктура).
 
 ## Чего не делать
 

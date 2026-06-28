@@ -11,6 +11,10 @@ env:
   # Каталог YC, от имени которого тарифицируется Vision OCR API (x-folder-id).
   # Сейчас одинаков для обоих окружений.
   OCR_API_FOLDER_ID: "b1g0gm5epaeepgfov6ni"
+  RUNTIME: "python314"
+  MEMORY: "2GB"
+  EXECUTION_TIMEOUT: "3600s"
+  CONCURRENCY: "1"
 
 jobs:
   lint:
@@ -42,31 +46,17 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Deploy function version
-        uses: yc-actions/yc-sls-function@v3
-        with:
-          yc-sa-json-credentials: ${{ secrets.YC_SA_JSON_CREDENTIALS_TEST }}
-          folder-id: ${{ secrets.YC_FOLDER_ID_TEST }}
-          function-name: ocr-processing
-          runtime: python314
-          entrypoint: handler.handler
-          memory: 2048Mb
-          execution-timeout: 3600
-          service-account: petergof-robot
-          source-root: ./src
-          include: |
-            **
-          # Каждая версия функции — полная спека: bucket-монтирование ОБЯЗАТЕЛЬНО
-          # передавать в каждом деплое, иначе новая версия его потеряет.
-          mounts: |
-            petergof-testing-backet:petergof-testing-backet
-          environment: |
-            FOLDER_ID=${{ env.OCR_API_FOLDER_ID }}
-            YANDEX_API_KEY=${{ secrets.YANDEX_API_KEY }}
-            BUCKET_MOUNT_POINT=/function/storage/petergof-testing-backet
-            INPUT_PREFIX=incoming/
-            API_BASE_URL=${{ vars.API_BASE_URL_TEST }}
-            CLOUD_FUNCTION_API_KEY=${{ secrets.CLOUD_FUNCTION_API_KEY }}
+      - name: Deploy ocr-processing version
+        env:
+          YC_SA_JSON: ${{ secrets.YC_SA_JSON_CREDENTIALS_TEST }}
+          FOLDER_ID: ${{ secrets.YC_FOLDER_ID_TEST }}
+          SA_ID: "ajeccs8j8b7igcjacd0r"
+          NETWORK_ID: "enp9p8putg0rnnnsa1c4"
+          BUCKET: "petergof-testing-backet"
+          OCR_API_KEY: ${{ secrets.YANDEX_API_KEY }}
+          API_BASE_URL: ${{ vars.API_BASE_URL_TEST }}
+          CLOUD_FUNCTION_API_KEY: ${{ secrets.CLOUD_FUNCTION_API_KEY }}
+        run: bash .github/deploy.sh
 
   # Merge to main -> deploy to the PROD cloud/folder.
   deploy-prod:
@@ -77,26 +67,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Deploy function version
-        uses: yc-actions/yc-sls-function@v3
-        with:
-          yc-sa-json-credentials: ${{ secrets.YC_SA_JSON_CREDENTIALS_PROD }}
-          folder-id: ${{ secrets.YC_FOLDER_ID_PROD }}
-          function-name: ocr-processing
-          runtime: python314
-          entrypoint: handler.handler
-          memory: 2048Mb
-          execution-timeout: 3600
-          service-account: petergof-robot
-          source-root: ./src
-          include: |
-            **
-          mounts: |
-            petergof-incoming-prod:petergof-incoming-prod
-          environment: |
-            FOLDER_ID=${{ env.OCR_API_FOLDER_ID }}
-            YANDEX_API_KEY=${{ secrets.YANDEX_API_KEY }}
-            BUCKET_MOUNT_POINT=/function/storage/petergof-incoming-prod
-            INPUT_PREFIX=incoming/
-            API_BASE_URL=${{ vars.API_BASE_URL_PROD }}
-            CLOUD_FUNCTION_API_KEY=${{ secrets.CLOUD_FUNCTION_API_KEY }}
+      - name: Deploy ocr-processing version
+        env:
+          YC_SA_JSON: ${{ secrets.YC_SA_JSON_CREDENTIALS_PROD }}
+          FOLDER_ID: ${{ secrets.YC_FOLDER_ID_PROD }}
+          SA_ID: "ajerbgv6jbhvacbev1id"
+          NETWORK_ID: "enpk8tubalksvn0nkkus"
+          BUCKET: "petergof-incoming-prod"
+          OCR_API_KEY: ${{ secrets.YANDEX_API_KEY }}
+          API_BASE_URL: ${{ vars.API_BASE_URL_PROD }}
+          CLOUD_FUNCTION_API_KEY: ${{ secrets.CLOUD_FUNCTION_API_KEY }}
+        run: bash .github/deploy.sh
