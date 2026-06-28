@@ -5,6 +5,7 @@ import json
 import random
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,10 @@ from reportlab.lib.fonts import addMapping
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
+
+from logging_config import get_logger
+
+logger = get_logger("ocr")
 
 
 class YandexOCRAsync:
@@ -140,7 +145,7 @@ class YandexOCRAsync:
             if path.exists():
                 path.unlink()
         except Exception as exc:
-            print(f"Failed to delete {path}: {exc}")
+            logger.warning(f"Failed to delete {path}: {exc}")
 
     def cleanup_tmp_files(self) -> None:
         if not self.tmp_dir.exists():
@@ -152,7 +157,7 @@ class YandexOCRAsync:
                 elif path.is_dir():
                     path.rmdir()
             except Exception as exc:
-                print(f"Failed to delete {path}: {exc}")
+                logger.warning(f"Failed to delete {path}: {exc}")
         try:
             self.tmp_dir.rmdir()
         except Exception:
@@ -186,7 +191,7 @@ class YandexOCRAsync:
         self._json_result_path().parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(self._json_tmp_path()), str(self._json_result_path()))
 
-        print(
+        logger.info(
             f"Saved final JSON: {self._json_result_path()} "
             f"(pages: {self._final_json_pages_written})"
         )
@@ -339,18 +344,18 @@ class YandexOCRAsync:
                         return data.get("id")
                     response_text = await response.text()
                     if response.status in {429, 500, 502, 503, 504}:
-                        print(f"attempt {attempt}/{max_retries}: {response_text}")
+                        logger.warning(f"attempt {attempt}/{max_retries}: {response_text}")
                     else:
-                        print(f"Permanent HTTP error {response.status}: {response_text}")
+                        logger.error(f"Permanent HTTP error {response.status}: {response_text}")
                         return None
             except (ConnectionTimeoutError, TimeoutError, ClientError) as exc:
-                print(f"attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}")
+                logger.warning(f"attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}")
             except Exception as exc:
-                print(f"attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}")
+                logger.warning(f"attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}")
             if attempt < max_retries:
                 import asyncio
                 await asyncio.sleep(base_delay + random.uniform(0, 1))
-        print("Failed after all retries")
+        logger.error("Failed after all retries")
         return None
 
     async def get_operation_result(
@@ -392,12 +397,12 @@ class YandexOCRAsync:
                     if response.status == 404:
                         await asyncio.sleep(delay)
                         continue
-                    print(f"Failed to get result: {response.status}")
+                    logger.warning(f"Failed to get result: {response.status}")
                     await asyncio.sleep(delay)
             except Exception as exc:
-                print(f"Error while polling OCR result: {exc}")
+                logger.warning(f"Error while polling OCR result: {exc}")
                 await asyncio.sleep(delay)
-        print(f"Operation timed out after {max_retries * delay} seconds")
+        logger.error(f"Operation timed out after {max_retries * delay} seconds")
         return None
 
     def extract_text_from_result(
@@ -547,7 +552,7 @@ class YandexOCRAsync:
                 gc.collect()
 
             if not operation_id:
-                print(f"OCR start failed for chunk {chunk_id}, batch {batch_id}")
+                logger.error(f"OCR start failed for chunk {chunk_id}, batch {batch_id}")
                 for page_num in page_numbers:
                     self.save_page_text(chunk_id, page_num, "")
                     self.save_page_json(chunk_id, page_num, "")
@@ -560,7 +565,7 @@ class YandexOCRAsync:
                 delay=3,
             )
             if not ocr_result:
-                print(f"OCR result failed for chunk {chunk_id}, batch {batch_id}")
+                logger.error(f"OCR result failed for chunk {chunk_id}, batch {batch_id}")
                 for page_num in page_numbers:
                     self.save_page_text(chunk_id, page_num, "")
                     self.save_page_json(chunk_id, page_num, "")
@@ -592,7 +597,9 @@ class YandexOCRAsync:
                     del image_single_page_bytes
                     gc.collect()
 
-                print(f"Processed page {page_num + 1} from chunk {chunk_id}, batch {batch_id}")
+                logger.info(
+                    f"Processed page {page_num + 1} from chunk {chunk_id}, batch {batch_id}"
+                )
                 del overlay_pdf_bytes
                 del text_blocks
                 gc.collect()
@@ -601,15 +608,18 @@ class YandexOCRAsync:
             del ocr_result
             gc.collect()
         except Exception as exc:
-            print(f"Chunk {chunk_id} batch {batch_id} failed: {type(exc).__name__}: {exc}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(
+                f"Chunk {chunk_id} batch {batch_id} failed (pages "
+                f"{page_numbers[0] + 1}-{page_numbers[-1] + 1}): {type(exc).__name__}: {exc}"
+            )
             for page_num in page_numbers:
                 try:
                     self.save_page_text(chunk_id, page_num, "")
                     self.save_page_json(chunk_id, page_num, "")
                 except Exception as save_exc:
-                    print(f"Failed to save empty result for page {page_num + 1}: {save_exc}")
+                    logger.warning(
+                        f"Failed to save empty result for page {page_num + 1}: {save_exc}"
+                    )
         finally:
             self.remove_file(batch_path)
             if image_batch_path is not None:
@@ -653,7 +663,7 @@ class YandexOCRAsync:
 
         try:
             tool_name = self._run_pdf_merge_tool(pdf_page_paths, chunk_pdf_path)
-            print(f"Built chunk PDF {chunk_id} with {tool_name}: {chunk_pdf_path}")
+            logger.info(f"Built chunk PDF {chunk_id} with {tool_name}: {chunk_pdf_path}")
             return
         except RuntimeError:
             pass
@@ -681,7 +691,7 @@ class YandexOCRAsync:
     def append_chunk_json_to_final(self, chunk_id: int) -> None:
         jsonl_path = self._chunk_jsonl_result_path(chunk_id)
         if not jsonl_path.exists():
-            print(f"Chunk JSONL does not exist: {jsonl_path}")
+            logger.warning(f"Chunk JSONL does not exist: {jsonl_path}")
             return
 
         with (
@@ -696,7 +706,7 @@ class YandexOCRAsync:
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError as e:
-                    print(
+                    logger.warning(
                         f"Invalid JSON line in chunk {chunk_id}, "
                         f"line {line_number}: {e}; content={line[:200]!r}"
                     )
@@ -769,7 +779,7 @@ class YandexOCRAsync:
 
         while len(current_paths) > 1:
             next_paths: list[Path] = []
-            print(
+            logger.info(
                 f"Final PDF merge round {round_index}: "
                 f"{len(current_paths)} files, fan_in={fan_in}"
             )
@@ -785,7 +795,7 @@ class YandexOCRAsync:
                     / f"round_{round_index:04d}_group_{group_index // fan_in:04d}.pdf"
                 )
                 tool_name = self._run_pdf_merge_tool(group, intermediate_path)
-                print(
+                logger.info(
                     f"Merged round={round_index} group={group_index // fan_in} "
                     f"with {tool_name}: {len(group)} -> {intermediate_path.name}"
                 )
@@ -796,7 +806,7 @@ class YandexOCRAsync:
                     if old_path not in input_paths and old_path.exists():
                         old_path.unlink()
                 except Exception as exc:
-                    print(f"Failed to delete intermediate merge file {old_path}: {exc}")
+                    logger.warning(f"Failed to delete intermediate merge file {old_path}: {exc}")
 
             current_paths = next_paths
             round_index += 1
@@ -808,11 +818,11 @@ class YandexOCRAsync:
             output_path.unlink()
 
         if final_candidate == output_path:
-            print(f"Saved final PDF: {output_path}")
+            logger.info(f"Saved final PDF: {output_path}")
             return
 
         final_candidate.replace(output_path)
-        print(f"Saved final PDF: {output_path}")
+        logger.info(f"Saved final PDF: {output_path}")
 
     def build_final_pdf_from_chunks(self, chunk_ids: list[int]) -> None:
         output_path = self._pdf_result_path()
@@ -887,8 +897,13 @@ class YandexOCRAsync:
     ) -> None:
         self.init_final_outputs()
 
+        started = time.monotonic()
         chunks = self.split_pdf_to_chunks(input_pdf_path=input_pdf_path, chunk_size=chunk_size)
-        print(f"Split into {len(chunks)} chunks")
+        total_pages = sum(len(page_numbers) for _, _, page_numbers in chunks)
+        logger.info(
+            f"Start OCR for {self.base_name}: {total_pages} pages, {len(chunks)} chunks "
+            f"(chunk_size={chunk_size}, batch_size={batch_size}, max_concurrent={max_concurrent})"
+        )
         timeout = ClientTimeout(total=600, connect=120, sock_connect=120, sock_read=300)
         connector = TCPConnector(limit=max(1, max_concurrent), ttl_dns_cache=300)
         processed_chunk_ids: list[int] = []
@@ -896,7 +911,12 @@ class YandexOCRAsync:
         try:
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 for chunk_id, chunk_pdf_path, page_numbers in chunks:
-                    print(f"Processing chunk {chunk_id} with {len(page_numbers)} pages")
+                    logger.info(
+                        f"Processing chunk {chunk_id}/{len(chunks) - 1} "
+                        f"with {len(page_numbers)} pages "
+                        f"(pages {page_numbers[0] + 1}-{page_numbers[-1] + 1})"
+                    )
+                    chunk_started = time.monotonic()
                     await self.process_chunk(
                         session,
                         chunk_id,
@@ -906,17 +926,28 @@ class YandexOCRAsync:
                         batch_size=batch_size,
                     )
                     processed_chunk_ids.append(chunk_id)
+                    logger.info(
+                        f"Chunk {chunk_id} done in {time.monotonic() - chunk_started:.1f}s"
+                    )
                     gc.collect()
 
             self.finalize_final_json()
 
-            print("Building final PDF from chunk files...")
+            logger.info("Building final PDF from chunk files...")
             self.build_final_pdf_from_chunks(processed_chunk_ids)
 
-            print(f"Uploaded merged result: {self._txt_result_path()}")
-            print(f"Uploaded merged result: {self._json_result_path()}")
-            print(f"Uploaded merged result: {self._pdf_result_path()}")
+            logger.info(
+                f"OCR finished for {self.base_name}: {total_pages} pages in "
+                f"{time.monotonic() - started:.1f}s"
+            )
+            logger.info(f"Saved result (txt): {self._txt_result_path()}")
+            logger.info(f"Saved result (json): {self._json_result_path()}")
+            logger.info(f"Saved result (pdf): {self._pdf_result_path()}")
         except Exception:
+            logger.exception(
+                f"OCR aborted for {self.base_name} after "
+                f"{time.monotonic() - started:.1f}s; processed chunks: {processed_chunk_ids}"
+            )
             try:
                 self.finalize_final_json()
             except Exception:

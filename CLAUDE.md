@@ -28,6 +28,31 @@ PDF в Object Storage (фронт кладёт файл под префикс `i
   `ocr_processing` → (`ocr_done` | `failed`). Watchdog ловит зависшие на `ocr_processing`.
 - **Конфиг** — `src/config.py`, всё из env с дефолтами. Тюнинг распознавания — `OCR_*`
   (DPI, JPEG-качество, размер чанка/батча, concurrency, strict-memory-режим для дебага).
+- **Логи** — `src/logging_config.py` (см. ниже). `print()` в коде НЕ использовать — только
+  `logger` из `get_logger(...)`, иначе строка потеряет ключ файла и не попадёт в трейс.
+
+## Логирование (как искать трейс по имени файла)
+
+`src/logging_config.py` настраивает root-логгер так, что в **каждой** строке есть
+`key=<object_id> req=<request_id>`. Ключ и request_id хранятся в `contextvars` и привязываются
+в начале `handler()` (`bind_context`), поэтому автоматически подхватываются во всех корутинах и
+тасках обработки одного файла — пробрасывать их по сигнатурам не нужно.
+
+Формат строки: `LEVEL key=<имя файла> req=<request_id> <logger>: <сообщение>`.
+
+Чтобы вытащить весь трейс одного запуска в Yandex Cloud Logging — фильтруй по подстроке с именем
+файла (или по `req=<request_id>`):
+
+```bash
+yc serverless function logs --id <fn-id> --folder-id <folder> --profile <prof> --since 3h \
+  | grep 'key=incoming/<имя файла>'
+```
+
+Уровень — env `LOG_LEVEL` (по умолчанию `INFO`). Ключевые точки: старт хендлера (bucket/key/
+request_id), путь и размер входного файла, конфиг OCR, число страниц/чанков, тайминг по чанкам и
+суммарный, статусы в API, ретраи/ошибки OCR API, фейлы батчей (с traceback через
+`logger.exception`), пути результатов. Падение пишется `logger.exception` и в хендлере, и в
+`process_pdf` (с указанием, сколько чанков успели обработать).
 
 ## Прод-баг, который чинит этот репозиторий (важно)
 
