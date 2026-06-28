@@ -16,6 +16,8 @@ from config import (
     OCR_DPI,
     OCR_JPEG_QUALITY,
     OCR_MAX_CONCURRENT,
+    OCR_MAX_FAILED_PAGES,
+    OCR_MAX_RPS,
     OCR_STRICT_MEMORY_MODE,
     RESULT_PREFIX,
     TMP_PREFIX,
@@ -112,6 +114,8 @@ def handler(event, context):
                 "chunk_size": OCR_CHUNK_SIZE,
                 "dpi": OCR_DPI,
                 "jpeg_quality": OCR_JPEG_QUALITY,
+                "max_rps": OCR_MAX_RPS,
+                "max_failed_pages": OCR_MAX_FAILED_PAGES,
             },
             ensure_ascii=False,
         ),
@@ -129,6 +133,8 @@ def handler(event, context):
         dpi=OCR_DPI,
         jpeg_quality=OCR_JPEG_QUALITY,
         strict_memory_mode=OCR_STRICT_MEMORY_MODE,
+        max_rps=OCR_MAX_RPS,
+        max_failed_pages=OCR_MAX_FAILED_PAGES,
     )
 
     _patch_status(key, "ocr_processing")

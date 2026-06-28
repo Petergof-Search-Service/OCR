@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import gc
 import io
@@ -6,6 +7,8 @@ import random
 import shutil
 import subprocess
 import time
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +26,66 @@ from logging_config import get_logger
 
 logger = get_logger("ocr")
 
+# HTTP-статусы OCR API, на которых имеет смысл повторить запрос.
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+class OCRAuthError(Exception):
+    """Ошибка авторизации OCR API (401/403). Прерывает всю обработку файла —
+    повторять бессмысленно (битый/просроченный YANDEX_API_KEY)."""
+
+
+class AsyncRateLimiter:
+    """Простой token-bucket для ограничения RPS к OCR API.
+
+    Лимитирует и отправку (`recognizeTextAsync`), и поллинг (`getRecognition`):
+    именно их суммарный поток упирался в 429. Потокобезопасен в пределах одного
+    event loop за счёт `asyncio.Lock`.
+    """
+
+    def __init__(self, rate_per_sec: float, burst: float | None = None):
+        self.rate = max(0.1, rate_per_sec)
+        self.capacity = burst if burst is not None else max(1.0, rate_per_sec)
+        self.tokens = self.capacity
+        self.updated = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+                wait = (1 - self.tokens) / self.rate
+            await asyncio.sleep(wait)
+
+
+def _parse_retry_after(headers) -> float | None:
+    """Вернуть задержку из заголовка Retry-After (секунды или HTTP-дата)."""
+    value = headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+        from datetime import datetime
+
+        delta = (when - datetime.now(UTC)).total_seconds()
+        return max(0.0, delta)
+    except Exception:
+        return None
+
+
+def _backoff_delay(attempt: int, base: float = 1.0, cap: float = 60.0) -> float:
+    """Экспоненциальный backoff с джиттером: base*2^(attempt-1), но не больше cap."""
+    return min(cap, base * (2 ** (attempt - 1))) + random.uniform(0, 1)
+
 
 class YandexOCRAsync:
     OCR_RECOGNIZE_URL = "https://ocr.api.cloud.yandex.net/ocr/v1/recognizeTextAsync"
@@ -39,6 +102,8 @@ class YandexOCRAsync:
         dpi: int = 200,
         jpeg_quality: int = 90,
         strict_memory_mode: bool = True,
+        max_rps: float = 8.0,
+        max_failed_pages: int = 0,
     ):
         self.api_key = api_key
         self.folder_id = folder_id
@@ -48,6 +113,13 @@ class YandexOCRAsync:
         self.dpi = dpi
         self.jpeg_quality = jpeg_quality
         self.strict_memory_mode = strict_memory_mode
+        self.max_failed_pages = max_failed_pages
+        self.rate_limiter = AsyncRateLimiter(max_rps)
+
+        # Учёт распознанных/потерянных страниц за прогон (для статуса failed).
+        self._pages_ok = 0
+        self._pages_failed = 0
+        self._failed_pages: list[int] = []
 
         self.headers = {
             "Authorization": f"Api-Key {api_key}",
@@ -324,8 +396,8 @@ class YandexOCRAsync:
         self,
         session: aiohttp.ClientSession,
         pdf_bytes: bytes,
-        max_retries: int = 10,
-        base_delay: float = 2.0,
+        max_retries: int = 12,
+        base_delay: float = 1.0,
     ) -> str | None:
         body = {
             "mimeType": "application/pdf",
@@ -335,7 +407,9 @@ class YandexOCRAsync:
         }
         headers = {**self.headers, "Content-Type": "application/json"}
         for attempt in range(1, max_retries + 1):
+            retry_after: float | None = None
             try:
+                await self.rate_limiter.acquire()
                 async with session.post(
                     self.OCR_RECOGNIZE_URL, headers=headers, json=body
                 ) as response:
@@ -343,33 +417,53 @@ class YandexOCRAsync:
                         data = await response.json()
                         return data.get("id")
                     response_text = await response.text()
-                    if response.status in {429, 500, 502, 503, 504}:
-                        logger.warning(f"attempt {attempt}/{max_retries}: {response_text}")
+                    if response.status in {401, 403}:
+                        # Битый/просроченный ключ — повторять бессмысленно, рвём весь файл.
+                        raise OCRAuthError(f"OCR API {response.status}: {response_text[:200]}")
+                    if response.status in RETRYABLE_STATUSES:
+                        retry_after = _parse_retry_after(response.headers)
+                        logger.warning(
+                            f"recognize attempt {attempt}/{max_retries}: "
+                            f"HTTP {response.status} {response_text[:160]}"
+                        )
                     else:
-                        logger.error(f"Permanent HTTP error {response.status}: {response_text}")
+                        logger.error(
+                            f"Permanent HTTP error {response.status}: {response_text[:200]}"
+                        )
                         return None
+            except OCRAuthError:
+                raise
             except (ConnectionTimeoutError, TimeoutError, ClientError) as exc:
-                logger.warning(f"attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}")
+                logger.warning(
+                    f"recognize attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}"
+                )
             except Exception as exc:
-                logger.warning(f"attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}")
+                logger.warning(
+                    f"recognize attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}"
+                )
             if attempt < max_retries:
-                import asyncio
-                await asyncio.sleep(base_delay + random.uniform(0, 1))
-        logger.error("Failed after all retries")
+                delay = (
+                    retry_after if retry_after is not None
+                    else _backoff_delay(attempt, base_delay)
+                )
+                await asyncio.sleep(delay)
+        logger.error("recognize: failed after all retries")
         return None
 
     async def get_operation_result(
         self,
         session: aiohttp.ClientSession,
         operation_id: str,
-        max_retries: int = 30,
-        delay: int = 3,
+        max_wait: float = 600.0,
+        poll_interval: float = 3.0,
     ) -> dict[str, Any] | None:
-        import asyncio
-
         url = self.OCR_RESULT_URL.format(operation_id=operation_id)
-        for _ in range(max_retries):
+        deadline = time.monotonic() + max_wait
+        rate_attempt = 0  # для эскалации backoff на 429/503
+        while time.monotonic() < deadline:
+            delay = poll_interval
             try:
+                await self.rate_limiter.acquire()
                 async with session.get(url, headers=self.headers) as response:
                     if response.status == 200:
                         text = await response.text()
@@ -395,14 +489,26 @@ class YandexOCRAsync:
                                 combined["result"]["pages"].append(result["result"])
                         return combined
                     if response.status == 404:
-                        await asyncio.sleep(delay)
+                        # Операция ещё выполняется — обычный поллинг, не rate-limit.
+                        rate_attempt = 0
+                        await asyncio.sleep(poll_interval)
                         continue
-                    logger.warning(f"Failed to get result: {response.status}")
-                    await asyncio.sleep(delay)
+                    if response.status in RETRYABLE_STATUSES:
+                        rate_attempt += 1
+                        retry_after = _parse_retry_after(response.headers)
+                        delay = retry_after if retry_after is not None else _backoff_delay(
+                            rate_attempt, base=poll_interval, cap=30.0
+                        )
+                        logger.warning(
+                            f"poll HTTP {response.status} (backoff {delay:.1f}s): "
+                            f"operation {operation_id}"
+                        )
+                    else:
+                        logger.warning(f"Failed to get result: {response.status}")
             except Exception as exc:
                 logger.warning(f"Error while polling OCR result: {exc}")
-                await asyncio.sleep(delay)
-        logger.error(f"Operation timed out after {max_retries * delay} seconds")
+            await asyncio.sleep(delay)
+        logger.error(f"Operation timed out after {max_wait:.0f}s: operation {operation_id}")
         return None
 
     def extract_text_from_result(
@@ -527,6 +633,10 @@ class YandexOCRAsync:
         except Exception:
             return result_bytes
 
+    def _mark_pages_failed(self, page_numbers: list[int]) -> None:
+        self._pages_failed += len(page_numbers)
+        self._failed_pages.extend(p + 1 for p in page_numbers)
+
     async def process_batch(
         self,
         session: aiohttp.ClientSession,
@@ -553,6 +663,7 @@ class YandexOCRAsync:
 
             if not operation_id:
                 logger.error(f"OCR start failed for chunk {chunk_id}, batch {batch_id}")
+                self._mark_pages_failed(page_numbers)
                 for page_num in page_numbers:
                     self.save_page_text(chunk_id, page_num, "")
                     self.save_page_json(chunk_id, page_num, "")
@@ -561,11 +672,10 @@ class YandexOCRAsync:
             ocr_result = await self.get_operation_result(
                 session=session,
                 operation_id=operation_id,
-                max_retries=30,
-                delay=3,
             )
             if not ocr_result:
                 logger.error(f"OCR result failed for chunk {chunk_id}, batch {batch_id}")
+                self._mark_pages_failed(page_numbers)
                 for page_num in page_numbers:
                     self.save_page_text(chunk_id, page_num, "")
                     self.save_page_json(chunk_id, page_num, "")
@@ -574,10 +684,17 @@ class YandexOCRAsync:
             parsed_pages = self.parse_multi_page_result(ocr_result)
             for idx, page_num in enumerate(page_numbers):
                 if idx >= len(parsed_pages):
+                    # Страница есть в батче, но её нет в ответе OCR — это потеря.
+                    logger.warning(
+                        f"Page {page_num + 1} missing in OCR result "
+                        f"(chunk {chunk_id}, batch {batch_id})"
+                    )
+                    self._mark_pages_failed([page_num])
                     self.save_page_text(chunk_id, page_num, "")
                     self.save_page_json(chunk_id, page_num, "")
                     continue
 
+                self._pages_ok += 1
                 text, text_blocks, ocr_page_dim = parsed_pages[idx]
                 self.save_page_text(chunk_id, page_num, text)
                 self.save_page_json(chunk_id, page_num, text)
@@ -607,11 +724,15 @@ class YandexOCRAsync:
             del parsed_pages
             del ocr_result
             gc.collect()
+        except OCRAuthError:
+            # Авторизация сломана — прерываем весь файл, а не глотаем как пустую страницу.
+            raise
         except Exception as exc:
             logger.exception(
                 f"Chunk {chunk_id} batch {batch_id} failed (pages "
                 f"{page_numbers[0] + 1}-{page_numbers[-1] + 1}): {type(exc).__name__}: {exc}"
             )
+            self._mark_pages_failed(page_numbers)
             for page_num in page_numbers:
                 try:
                     self.save_page_text(chunk_id, page_num, "")
@@ -661,22 +782,8 @@ class YandexOCRAsync:
                 empty_doc.save(chunk_pdf_path, garbage=4, deflate=True, clean=True)
             return
 
-        try:
-            tool_name = self._run_pdf_merge_tool(pdf_page_paths, chunk_pdf_path)
-            logger.info(f"Built chunk PDF {chunk_id} with {tool_name}: {chunk_pdf_path}")
-            return
-        except RuntimeError:
-            pass
-
-        writer = PdfWriter()
-        for page_path in pdf_page_paths:
-            with page_path.open("rb") as src:
-                reader = PdfReader(src)
-                if reader.pages:
-                    writer.add_page(reader.pages[0])
-
-        with chunk_pdf_path.open("wb") as dst:
-            writer.write(dst)
+        tool_name = self._merge_pdfs(pdf_page_paths, chunk_pdf_path)
+        logger.info(f"Built chunk PDF {chunk_id} with {tool_name}: {chunk_pdf_path}")
 
     def append_chunk_txt_to_final(self, chunk_id: int, is_first_chunk: bool) -> None:
         mode = "a" if self._txt_result_path().exists() else "w"
@@ -720,6 +827,34 @@ class YandexOCRAsync:
                 self._final_json_pages_written += 1
 
 
+    @staticmethod
+    def _run_merge_cmd(cmd: list[str], tool: str) -> None:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            # -q/-dQUIET глушат вывод gs, поэтому логируем то, что есть.
+            logger.error(
+                f"{tool} merge failed (exit {result.returncode}): "
+                f"stderr={result.stderr.strip()[:300]} stdout={result.stdout.strip()[:200]}"
+            )
+            raise subprocess.CalledProcessError(
+                result.returncode, cmd, result.stdout, result.stderr
+            )
+
+    def _merge_pdfs_pypdf(self, input_paths: list[Path], output_path: Path) -> None:
+        """Фолбэк-слияние через pypdf (постранично, без внешних утилит)."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = PdfWriter()
+        for path in input_paths:
+            try:
+                with path.open("rb") as src:
+                    reader = PdfReader(src)
+                    for page in reader.pages:
+                        writer.add_page(page)
+            except Exception as exc:
+                logger.warning(f"pypdf merge: skipping {path}: {exc}")
+        with output_path.open("wb") as dst:
+            writer.write(dst)
+
     def _run_pdf_merge_tool(self, input_paths: list[Path], output_path: Path) -> str:
         if not input_paths:
             raise ValueError("input_paths is empty")
@@ -728,38 +863,52 @@ class YandexOCRAsync:
 
         pdfunite_path = shutil.which("pdfunite")
         if pdfunite_path:
-            cmd = [pdfunite_path, *[str(p) for p in input_paths], str(output_path)]
-            subprocess.run(cmd, check=True)
+            self._run_merge_cmd(
+                [pdfunite_path, *[str(p) for p in input_paths], str(output_path)], "pdfunite"
+            )
             return "pdfunite"
 
         qpdf_path = shutil.which("qpdf")
         if qpdf_path:
-            cmd = [
-                qpdf_path,
-                "--empty",
-                "--pages",
-                *[str(p) for p in input_paths],
-                "--",
-                str(output_path),
-            ]
-            subprocess.run(cmd, check=True)
+            self._run_merge_cmd(
+                [
+                    qpdf_path,
+                    "--empty",
+                    "--pages",
+                    *[str(p) for p in input_paths],
+                    "--",
+                    str(output_path),
+                ],
+                "qpdf",
+            )
             return "qpdf"
 
         gs_path = shutil.which("gs")
         if gs_path:
-            cmd = [
-                gs_path,
-                "-dBATCH",
-                "-dNOPAUSE",
-                "-q",
-                "-sDEVICE=pdfwrite",
-                f"-sOutputFile={output_path}",
-                *[str(p) for p in input_paths],
-            ]
-            subprocess.run(cmd, check=True)
+            self._run_merge_cmd(
+                [
+                    gs_path,
+                    "-dBATCH",
+                    "-dNOPAUSE",
+                    "-q",
+                    "-sDEVICE=pdfwrite",
+                    f"-sOutputFile={output_path}",
+                    *[str(p) for p in input_paths],
+                ],
+                "ghostscript",
+            )
             return "ghostscript"
 
         raise RuntimeError("No PDF merge tool found: pdfunite, qpdf, gs")
+
+    def _merge_pdfs(self, input_paths: list[Path], output_path: Path) -> str:
+        """Слить PDF внешней утилитой; при её отсутствии/ошибке — фолбэк на pypdf."""
+        try:
+            return self._run_pdf_merge_tool(input_paths, output_path)
+        except (RuntimeError, subprocess.CalledProcessError) as exc:
+            logger.warning(f"External PDF merge failed ({exc}); falling back to pypdf")
+            self._merge_pdfs_pypdf(input_paths, output_path)
+            return "pypdf"
 
     def _merge_pdf_files_tree(
         self,
@@ -794,7 +943,7 @@ class YandexOCRAsync:
                     merge_tmp_dir
                     / f"round_{round_index:04d}_group_{group_index // fan_in:04d}.pdf"
                 )
-                tool_name = self._run_pdf_merge_tool(group, intermediate_path)
+                tool_name = self._merge_pdfs(group, intermediate_path)
                 logger.info(
                     f"Merged round={round_index} group={group_index // fan_in} "
                     f"with {tool_name}: {len(group)} -> {intermediate_path.name}"
@@ -863,8 +1012,6 @@ class YandexOCRAsync:
         effective_parallel_batches = 1 if self.strict_memory_mode else max(1, max_concurrent)
 
         if effective_parallel_batches != 1:
-            import asyncio
-
             semaphore = asyncio.Semaphore(effective_parallel_batches)
 
             async def _run(batch_path: Path, pages: list[int], batch_id: int) -> None:
@@ -875,7 +1022,11 @@ class YandexOCRAsync:
                 asyncio.create_task(_run(batch_path, pages, batch_id))
                 for batch_path, pages, batch_id in batches
             ]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Ошибку авторизации пробрасываем — нет смысла продолжать весь файл.
+            for r in results:
+                if isinstance(r, OCRAuthError):
+                    raise r
         else:
             for batch_path, pages, batch_id in batches:
                 await self.process_batch(session, chunk_id, batch_path, pages, batch_id)
@@ -896,6 +1047,9 @@ class YandexOCRAsync:
         cleanup_tmp_files: bool = False,
     ) -> None:
         self.init_final_outputs()
+        self._pages_ok = 0
+        self._pages_failed = 0
+        self._failed_pages = []
 
         started = time.monotonic()
         chunks = self.split_pdf_to_chunks(input_pdf_path=input_pdf_path, chunk_size=chunk_size)
@@ -940,9 +1094,22 @@ class YandexOCRAsync:
                 f"OCR finished for {self.base_name}: {total_pages} pages in "
                 f"{time.monotonic() - started:.1f}s"
             )
+            logger.info(
+                f"Pages summary: total={total_pages} ok={self._pages_ok} "
+                f"failed={self._pages_failed}"
+            )
             logger.info(f"Saved result (txt): {self._txt_result_path()}")
             logger.info(f"Saved result (json): {self._json_result_path()}")
             logger.info(f"Saved result (pdf): {self._pdf_result_path()}")
+
+            # Строгая политика: непустая потеря страниц сверх порога => файл failed,
+            # чтобы в индекс не попал неполный документ (его можно перезапустить).
+            if self._pages_failed > self.max_failed_pages:
+                raise RuntimeError(
+                    f"OCR incomplete: {self._pages_failed}/{total_pages} pages failed "
+                    f"(allowed {self.max_failed_pages}); failed pages "
+                    f"e.g. {self._failed_pages[:30]}"
+                )
         except Exception:
             logger.exception(
                 f"OCR aborted for {self.base_name} after "
