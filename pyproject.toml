@@ -1,0 +1,9 @@
+[tool.ruff]
+line-length = 100
+# py312 — максимальный target, поддерживаемый ruff; на статанализ кода под
+# рантаймом python314 в Yandex Cloud это не влияет.
+target-version = "py312"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

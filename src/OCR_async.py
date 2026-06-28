@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import gc
 import io
@@ -5,8 +6,11 @@ import json
 import random
 import shutil
 import subprocess
+import time
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import aiohttp
 import fitz
@@ -17,6 +21,70 @@ from reportlab.lib.fonts import addMapping
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
+
+from logging_config import get_logger
+
+logger = get_logger("ocr")
+
+# HTTP-статусы OCR API, на которых имеет смысл повторить запрос.
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+class OCRAuthError(Exception):
+    """Ошибка авторизации OCR API (401/403). Прерывает всю обработку файла —
+    повторять бессмысленно (битый/просроченный YANDEX_API_KEY)."""
+
+
+class AsyncRateLimiter:
+    """Простой token-bucket для ограничения RPS к OCR API.
+
+    Лимитирует и отправку (`recognizeTextAsync`), и поллинг (`getRecognition`):
+    именно их суммарный поток упирался в 429. Потокобезопасен в пределах одного
+    event loop за счёт `asyncio.Lock`.
+    """
+
+    def __init__(self, rate_per_sec: float, burst: float | None = None):
+        self.rate = max(0.1, rate_per_sec)
+        self.capacity = burst if burst is not None else max(1.0, rate_per_sec)
+        self.tokens = self.capacity
+        self.updated = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+                wait = (1 - self.tokens) / self.rate
+            await asyncio.sleep(wait)
+
+
+def _parse_retry_after(headers) -> float | None:
+    """Вернуть задержку из заголовка Retry-After (секунды или HTTP-дата)."""
+    value = headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+        from datetime import datetime
+
+        delta = (when - datetime.now(UTC)).total_seconds()
+        return max(0.0, delta)
+    except Exception:
+        return None
+
+
+def _backoff_delay(attempt: int, base: float = 1.0, cap: float = 60.0) -> float:
+    """Экспоненциальный backoff с джиттером: base*2^(attempt-1), но не больше cap."""
+    return min(cap, base * (2 ** (attempt - 1))) + random.uniform(0, 1)
 
 
 class YandexOCRAsync:
@@ -34,6 +102,8 @@ class YandexOCRAsync:
         dpi: int = 200,
         jpeg_quality: int = 90,
         strict_memory_mode: bool = True,
+        max_rps: float = 8.0,
+        max_failed_pages: int = 0,
     ):
         self.api_key = api_key
         self.folder_id = folder_id
@@ -43,6 +113,13 @@ class YandexOCRAsync:
         self.dpi = dpi
         self.jpeg_quality = jpeg_quality
         self.strict_memory_mode = strict_memory_mode
+        self.max_failed_pages = max_failed_pages
+        self.rate_limiter = AsyncRateLimiter(max_rps)
+
+        # Учёт распознанных/потерянных страниц за прогон (для статуса failed).
+        self._pages_ok = 0
+        self._pages_failed = 0
+        self._failed_pages: list[int] = []
 
         self.headers = {
             "Authorization": f"Api-Key {api_key}",
@@ -115,6 +192,9 @@ class YandexOCRAsync:
     def _json_result_path(self) -> Path:
         return self.result_json_dir / f"{self.base_name}.json"
 
+    def _json_tmp_path(self) -> Path:
+        return self.tmp_dir / f"{self.base_name}.json"
+
     def _pdf_result_path(self) -> Path:
         return self.result_pdf_dir / f"{self.base_name}.pdf"
 
@@ -137,7 +217,7 @@ class YandexOCRAsync:
             if path.exists():
                 path.unlink()
         except Exception as exc:
-            print(f"Failed to delete {path}: {exc}")
+            logger.warning(f"Failed to delete {path}: {exc}")
 
     def cleanup_tmp_files(self) -> None:
         if not self.tmp_dir.exists():
@@ -149,7 +229,7 @@ class YandexOCRAsync:
                 elif path.is_dir():
                     path.rmdir()
             except Exception as exc:
-                print(f"Failed to delete {path}: {exc}")
+                logger.warning(f"Failed to delete {path}: {exc}")
         try:
             self.tmp_dir.rmdir()
         except Exception:
@@ -163,7 +243,7 @@ class YandexOCRAsync:
         with self._txt_result_path().open("w", encoding="utf-8"):
             pass
 
-        with self._json_result_path().open("w", encoding="utf-8") as out:
+        with self._json_tmp_path().open("w", encoding="utf-8") as out:
             out.write('{"data":[\n')
 
         self._final_json_first_item = True
@@ -175,11 +255,15 @@ class YandexOCRAsync:
         if not self._final_json_initialized or self._final_json_finalized:
             return
 
-        with self._json_result_path().open("a", encoding="utf-8") as out:
+        with self._json_tmp_path().open("a", encoding="utf-8") as out:
             out.write('\n]}\n')
 
         self._final_json_finalized = True
-        print(
+
+        self._json_result_path().parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(self._json_tmp_path()), str(self._json_result_path()))
+
+        logger.info(
             f"Saved final JSON: {self._json_result_path()} "
             f"(pages: {self._final_json_pages_written})"
         )
@@ -194,10 +278,12 @@ class YandexOCRAsync:
             encoding="utf-8",
         )
 
-    def split_pdf_to_chunks(self, input_pdf_path: Path, chunk_size: int = 50) -> List[Tuple[int, Path, List[int]]]:
+    def split_pdf_to_chunks(
+        self, input_pdf_path: Path, chunk_size: int = 50
+    ) -> list[tuple[int, Path, list[int]]]:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be > 0")
-        chunks: List[Tuple[int, Path, List[int]]] = []
+        chunks: list[tuple[int, Path, list[int]]] = []
         with input_pdf_path.open("rb") as src:
             reader = PdfReader(src)
             total_pages = len(reader.pages)
@@ -217,12 +303,12 @@ class YandexOCRAsync:
         self,
         chunk_id: int,
         chunk_pdf_path: Path,
-        global_page_numbers: List[int],
+        global_page_numbers: list[int],
         batch_size: int = 1,
-    ) -> List[Tuple[Path, List[int], int]]:
+    ) -> list[tuple[Path, list[int], int]]:
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0")
-        batches: List[Tuple[Path, List[int], int]] = []
+        batches: list[tuple[Path, list[int], int]] = []
         with chunk_pdf_path.open("rb") as src:
             reader = PdfReader(src)
             total_pages = len(reader.pages)
@@ -244,12 +330,12 @@ class YandexOCRAsync:
         batch_pdf_path: Path,
         chunk_id: int,
         batch_id: int,
-        page_numbers: List[int],
-    ) -> Tuple[Path, List[Path]]:
+        page_numbers: list[int],
+    ) -> tuple[Path, list[Path]]:
         zoom = self.dpi / 72.0
         matrix = fitz.Matrix(zoom, zoom)
         batch_output = fitz.open()
-        per_page_paths: List[Path] = []
+        per_page_paths: list[Path] = []
         src = fitz.open(batch_pdf_path)
         try:
             for local_index, page in enumerate(src):
@@ -277,7 +363,9 @@ class YandexOCRAsync:
                 page_rect = page.rect
                 single_doc = fitz.open()
                 try:
-                    single_page = single_doc.new_page(width=page_rect.width, height=page_rect.height)
+                    single_page = single_doc.new_page(
+                        width=page_rect.width, height=page_rect.height
+                    )
                     single_page.insert_image(page_rect, stream=jpeg_bytes, keep_proportion=True)
                     single_bytes = single_doc.tobytes(garbage=4, deflate=True, clean=True)
                 finally:
@@ -308,9 +396,9 @@ class YandexOCRAsync:
         self,
         session: aiohttp.ClientSession,
         pdf_bytes: bytes,
-        max_retries: int = 10,
-        base_delay: float = 2.0,
-    ) -> Optional[str]:
+        max_retries: int = 12,
+        base_delay: float = 1.0,
+    ) -> str | None:
         body = {
             "mimeType": "application/pdf",
             "languageCodes": ["*"],
@@ -319,39 +407,63 @@ class YandexOCRAsync:
         }
         headers = {**self.headers, "Content-Type": "application/json"}
         for attempt in range(1, max_retries + 1):
+            retry_after: float | None = None
             try:
-                async with session.post(self.OCR_RECOGNIZE_URL, headers=headers, json=body) as response:
+                await self.rate_limiter.acquire()
+                async with session.post(
+                    self.OCR_RECOGNIZE_URL, headers=headers, json=body
+                ) as response:
                     if response.status == 200:
                         data = await response.json()
                         return data.get("id")
                     response_text = await response.text()
-                    if response.status in {429, 500, 502, 503, 504}:
-                        print(f"attempt {attempt}/{max_retries}: {response_text}")
+                    if response.status in {401, 403}:
+                        # Битый/просроченный ключ — повторять бессмысленно, рвём весь файл.
+                        raise OCRAuthError(f"OCR API {response.status}: {response_text[:200]}")
+                    if response.status in RETRYABLE_STATUSES:
+                        retry_after = _parse_retry_after(response.headers)
+                        logger.warning(
+                            f"recognize attempt {attempt}/{max_retries}: "
+                            f"HTTP {response.status} {response_text[:160]}"
+                        )
                     else:
-                        print(f"Permanent HTTP error {response.status}: {response_text}")
+                        logger.error(
+                            f"Permanent HTTP error {response.status}: {response_text[:200]}"
+                        )
                         return None
+            except OCRAuthError:
+                raise
             except (ConnectionTimeoutError, TimeoutError, ClientError) as exc:
-                print(f"attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}")
+                logger.warning(
+                    f"recognize attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}"
+                )
             except Exception as exc:
-                print(f"attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}")
+                logger.warning(
+                    f"recognize attempt {attempt}/{max_retries}: {type(exc).__name__}: {exc}"
+                )
             if attempt < max_retries:
-                import asyncio
-                await asyncio.sleep(base_delay + random.uniform(0, 1))
-        print("Failed after all retries")
+                delay = (
+                    retry_after if retry_after is not None
+                    else _backoff_delay(attempt, base_delay)
+                )
+                await asyncio.sleep(delay)
+        logger.error("recognize: failed after all retries")
         return None
 
     async def get_operation_result(
         self,
         session: aiohttp.ClientSession,
         operation_id: str,
-        max_retries: int = 30,
-        delay: int = 3,
-    ) -> Optional[Dict[str, Any]]:
-        import asyncio
-
+        max_wait: float = 600.0,
+        poll_interval: float = 3.0,
+    ) -> dict[str, Any] | None:
         url = self.OCR_RESULT_URL.format(operation_id=operation_id)
-        for _ in range(max_retries):
+        deadline = time.monotonic() + max_wait
+        rate_attempt = 0  # для эскалации backoff на 429/503
+        while time.monotonic() < deadline:
+            delay = poll_interval
             try:
+                await self.rate_limiter.acquire()
                 async with session.get(url, headers=self.headers) as response:
                     if response.status == 200:
                         text = await response.text()
@@ -377,20 +489,32 @@ class YandexOCRAsync:
                                 combined["result"]["pages"].append(result["result"])
                         return combined
                     if response.status == 404:
-                        await asyncio.sleep(delay)
+                        # Операция ещё выполняется — обычный поллинг, не rate-limit.
+                        rate_attempt = 0
+                        await asyncio.sleep(poll_interval)
                         continue
-                    print(f"Failed to get result: {response.status}")
-                    await asyncio.sleep(delay)
+                    if response.status in RETRYABLE_STATUSES:
+                        rate_attempt += 1
+                        retry_after = _parse_retry_after(response.headers)
+                        delay = retry_after if retry_after is not None else _backoff_delay(
+                            rate_attempt, base=poll_interval, cap=30.0
+                        )
+                        logger.warning(
+                            f"poll HTTP {response.status} (backoff {delay:.1f}s): "
+                            f"operation {operation_id}"
+                        )
+                    else:
+                        logger.warning(f"Failed to get result: {response.status}")
             except Exception as exc:
-                print(f"Error while polling OCR result: {exc}")
-                await asyncio.sleep(delay)
-        print(f"Operation timed out after {max_retries * delay} seconds")
+                logger.warning(f"Error while polling OCR result: {exc}")
+            await asyncio.sleep(delay)
+        logger.error(f"Operation timed out after {max_wait:.0f}s: operation {operation_id}")
         return None
 
     def extract_text_from_result(
         self,
-        ocr_result: Optional[Dict[str, Any]],
-    ) -> Tuple[str, List[Dict[str, float | str]], Dict[str, float]]:
+        ocr_result: dict[str, Any] | None,
+    ) -> tuple[str, list[dict[str, float | str]], dict[str, float]]:
         if not ocr_result or "result" not in ocr_result:
             return "", [], {"ocr_width": 0.0, "ocr_height": 0.0}
         result = ocr_result["result"]
@@ -398,8 +522,8 @@ class YandexOCRAsync:
         ocr_width = float(text_annotation.get("width", 0.0))
         ocr_height = float(text_annotation.get("height", 0.0))
 
-        full_text: List[str] = []
-        text_blocks: List[Dict[str, float | str]] = []
+        full_text: list[str] = []
+        text_blocks: list[dict[str, float | str]] = []
         for block in text_annotation.get("blocks", []):
             for line in block.get("lines", []):
                 text = line.get("text")
@@ -426,8 +550,8 @@ class YandexOCRAsync:
 
     def parse_multi_page_result(
         self,
-        ocr_result: Optional[Dict[str, Any]],
-    ) -> List[Tuple[str, List[Dict[str, float | str]], Dict[str, float]]]:
+        ocr_result: dict[str, Any] | None,
+    ) -> list[tuple[str, list[dict[str, float | str]], dict[str, float]]]:
         if not ocr_result or "result" not in ocr_result:
             return []
         result = ocr_result["result"]
@@ -437,8 +561,8 @@ class YandexOCRAsync:
     def create_text_overlay_pdf(
         self,
         image_only_pdf_bytes: bytes,
-        text_blocks: List[Dict[str, float | str]],
-        ocr_page_dim: Dict[str, float],
+        text_blocks: list[dict[str, float | str]],
+        ocr_page_dim: dict[str, float],
     ) -> bytes:
         reader = PdfReader(io.BytesIO(image_only_pdf_bytes))
         writer = PdfWriter()
@@ -509,16 +633,20 @@ class YandexOCRAsync:
         except Exception:
             return result_bytes
 
+    def _mark_pages_failed(self, page_numbers: list[int]) -> None:
+        self._pages_failed += len(page_numbers)
+        self._failed_pages.extend(p + 1 for p in page_numbers)
+
     async def process_batch(
         self,
         session: aiohttp.ClientSession,
         chunk_id: int,
         batch_path: Path,
-        page_numbers: List[int],
+        page_numbers: list[int],
         batch_id: int,
     ) -> None:
-        image_batch_path: Optional[Path] = None
-        image_page_paths: List[Path] = []
+        image_batch_path: Path | None = None
+        image_page_paths: list[Path] = []
         try:
             image_batch_path, image_page_paths = self.render_batch_to_image_pdfs(
                 batch_pdf_path=batch_path,
@@ -534,7 +662,8 @@ class YandexOCRAsync:
                 gc.collect()
 
             if not operation_id:
-                print(f"OCR start failed for chunk {chunk_id}, batch {batch_id}")
+                logger.error(f"OCR start failed for chunk {chunk_id}, batch {batch_id}")
+                self._mark_pages_failed(page_numbers)
                 for page_num in page_numbers:
                     self.save_page_text(chunk_id, page_num, "")
                     self.save_page_json(chunk_id, page_num, "")
@@ -543,11 +672,10 @@ class YandexOCRAsync:
             ocr_result = await self.get_operation_result(
                 session=session,
                 operation_id=operation_id,
-                max_retries=30,
-                delay=3,
             )
             if not ocr_result:
-                print(f"OCR result failed for chunk {chunk_id}, batch {batch_id}")
+                logger.error(f"OCR result failed for chunk {chunk_id}, batch {batch_id}")
+                self._mark_pages_failed(page_numbers)
                 for page_num in page_numbers:
                     self.save_page_text(chunk_id, page_num, "")
                     self.save_page_json(chunk_id, page_num, "")
@@ -556,10 +684,17 @@ class YandexOCRAsync:
             parsed_pages = self.parse_multi_page_result(ocr_result)
             for idx, page_num in enumerate(page_numbers):
                 if idx >= len(parsed_pages):
+                    # Страница есть в батче, но её нет в ответе OCR — это потеря.
+                    logger.warning(
+                        f"Page {page_num + 1} missing in OCR result "
+                        f"(chunk {chunk_id}, batch {batch_id})"
+                    )
+                    self._mark_pages_failed([page_num])
                     self.save_page_text(chunk_id, page_num, "")
                     self.save_page_json(chunk_id, page_num, "")
                     continue
 
+                self._pages_ok += 1
                 text, text_blocks, ocr_page_dim = parsed_pages[idx]
                 self.save_page_text(chunk_id, page_num, text)
                 self.save_page_json(chunk_id, page_num, text)
@@ -572,12 +707,16 @@ class YandexOCRAsync:
                         text_blocks,
                         ocr_page_dim,
                     )
-                    self.write_bytes(self._chunk_overlay_pdf_path(chunk_id, page_num), overlay_pdf_bytes)
+                    self.write_bytes(
+                        self._chunk_overlay_pdf_path(chunk_id, page_num), overlay_pdf_bytes
+                    )
                 finally:
                     del image_single_page_bytes
                     gc.collect()
 
-                print(f"Processed page {page_num + 1} from chunk {chunk_id}, batch {batch_id}")
+                logger.info(
+                    f"Processed page {page_num + 1} from chunk {chunk_id}, batch {batch_id}"
+                )
                 del overlay_pdf_bytes
                 del text_blocks
                 gc.collect()
@@ -585,16 +724,23 @@ class YandexOCRAsync:
             del parsed_pages
             del ocr_result
             gc.collect()
+        except OCRAuthError:
+            # Авторизация сломана — прерываем весь файл, а не глотаем как пустую страницу.
+            raise
         except Exception as exc:
-            print(f"Chunk {chunk_id} batch {batch_id} failed: {type(exc).__name__}: {exc}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(
+                f"Chunk {chunk_id} batch {batch_id} failed (pages "
+                f"{page_numbers[0] + 1}-{page_numbers[-1] + 1}): {type(exc).__name__}: {exc}"
+            )
+            self._mark_pages_failed(page_numbers)
             for page_num in page_numbers:
                 try:
                     self.save_page_text(chunk_id, page_num, "")
                     self.save_page_json(chunk_id, page_num, "")
                 except Exception as save_exc:
-                    print(f"Failed to save empty result for page {page_num + 1}: {save_exc}")
+                    logger.warning(
+                        f"Failed to save empty result for page {page_num + 1}: {save_exc}"
+                    )
         finally:
             self.remove_file(batch_path)
             if image_batch_path is not None:
@@ -603,7 +749,7 @@ class YandexOCRAsync:
                 self.remove_file(image_page_path)
             gc.collect()
 
-    def build_chunk_outputs(self, chunk_id: int, page_numbers: List[int]) -> None:
+    def build_chunk_outputs(self, chunk_id: int, page_numbers: list[int]) -> None:
         with self._chunk_txt_result_path(chunk_id).open("w", encoding="utf-8") as txt_out:
             for idx, page_number in enumerate(page_numbers):
                 page_path = self._chunk_page_txt_path(chunk_id, page_number)
@@ -618,7 +764,9 @@ class YandexOCRAsync:
                 if page_path.exists():
                     jsonl_out.write(page_path.read_text(encoding="utf-8").strip())
                 else:
-                    jsonl_out.write(json.dumps({"page": page_number + 1, "text": ""}, ensure_ascii=False))
+                    jsonl_out.write(
+                        json.dumps({"page": page_number + 1, "text": ""}, ensure_ascii=False)
+                    )
                 jsonl_out.write("\n")
 
         chunk_pdf_path = self._chunk_pdf_result_path(chunk_id)
@@ -634,29 +782,15 @@ class YandexOCRAsync:
                 empty_doc.save(chunk_pdf_path, garbage=4, deflate=True, clean=True)
             return
 
-        try:
-            tool_name = self._run_pdf_merge_tool(pdf_page_paths, chunk_pdf_path)
-            print(f"Built chunk PDF {chunk_id} with {tool_name}: {chunk_pdf_path}")
-            return
-        except RuntimeError:
-            pass
-
-        writer = PdfWriter()
-        for page_path in pdf_page_paths:
-            with page_path.open("rb") as src:
-                reader = PdfReader(src)
-                if reader.pages:
-                    writer.add_page(reader.pages[0])
-
-        with chunk_pdf_path.open("wb") as dst:
-            writer.write(dst)
+        tool_name = self._merge_pdfs(pdf_page_paths, chunk_pdf_path)
+        logger.info(f"Built chunk PDF {chunk_id} with {tool_name}: {chunk_pdf_path}")
 
     def append_chunk_txt_to_final(self, chunk_id: int, is_first_chunk: bool) -> None:
         mode = "a" if self._txt_result_path().exists() else "w"
-        with self._chunk_txt_result_path(chunk_id).open("r", encoding="utf-8") as src, self._txt_result_path().open(
-            mode,
-            encoding="utf-8",
-        ) as dst:
+        with (
+            self._chunk_txt_result_path(chunk_id).open("r", encoding="utf-8") as src,
+            self._txt_result_path().open(mode, encoding="utf-8") as dst,
+        ):
             if not is_first_chunk:
                 dst.write("\n\n")
             dst.write(src.read())
@@ -664,10 +798,13 @@ class YandexOCRAsync:
     def append_chunk_json_to_final(self, chunk_id: int) -> None:
         jsonl_path = self._chunk_jsonl_result_path(chunk_id)
         if not jsonl_path.exists():
-            print(f"Chunk JSONL does not exist: {jsonl_path}")
+            logger.warning(f"Chunk JSONL does not exist: {jsonl_path}")
             return
 
-        with jsonl_path.open("r", encoding="utf-8") as src, self._json_result_path().open("a", encoding="utf-8") as dst:
+        with (
+            jsonl_path.open("r", encoding="utf-8") as src,
+            self._json_tmp_path().open("a", encoding="utf-8") as dst,
+        ):
             for line_number, line in enumerate(src, start=1):
                 line = line.strip()
                 if not line:
@@ -676,7 +813,7 @@ class YandexOCRAsync:
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError as e:
-                    print(
+                    logger.warning(
                         f"Invalid JSON line in chunk {chunk_id}, "
                         f"line {line_number}: {e}; content={line[:200]!r}"
                     )
@@ -690,7 +827,35 @@ class YandexOCRAsync:
                 self._final_json_pages_written += 1
 
 
-    def _run_pdf_merge_tool(self, input_paths: List[Path], output_path: Path) -> str:
+    @staticmethod
+    def _run_merge_cmd(cmd: list[str], tool: str) -> None:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            # -q/-dQUIET глушат вывод gs, поэтому логируем то, что есть.
+            logger.error(
+                f"{tool} merge failed (exit {result.returncode}): "
+                f"stderr={result.stderr.strip()[:300]} stdout={result.stdout.strip()[:200]}"
+            )
+            raise subprocess.CalledProcessError(
+                result.returncode, cmd, result.stdout, result.stderr
+            )
+
+    def _merge_pdfs_pypdf(self, input_paths: list[Path], output_path: Path) -> None:
+        """Фолбэк-слияние через pypdf (постранично, без внешних утилит)."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = PdfWriter()
+        for path in input_paths:
+            try:
+                with path.open("rb") as src:
+                    reader = PdfReader(src)
+                    for page in reader.pages:
+                        writer.add_page(page)
+            except Exception as exc:
+                logger.warning(f"pypdf merge: skipping {path}: {exc}")
+        with output_path.open("wb") as dst:
+            writer.write(dst)
+
+    def _run_pdf_merge_tool(self, input_paths: list[Path], output_path: Path) -> str:
         if not input_paths:
             raise ValueError("input_paths is empty")
 
@@ -698,35 +863,56 @@ class YandexOCRAsync:
 
         pdfunite_path = shutil.which("pdfunite")
         if pdfunite_path:
-            cmd = [pdfunite_path, *[str(p) for p in input_paths], str(output_path)]
-            subprocess.run(cmd, check=True)
+            self._run_merge_cmd(
+                [pdfunite_path, *[str(p) for p in input_paths], str(output_path)], "pdfunite"
+            )
             return "pdfunite"
 
         qpdf_path = shutil.which("qpdf")
         if qpdf_path:
-            cmd = [qpdf_path, "--empty", "--pages", *[str(p) for p in input_paths], "--", str(output_path)]
-            subprocess.run(cmd, check=True)
+            self._run_merge_cmd(
+                [
+                    qpdf_path,
+                    "--empty",
+                    "--pages",
+                    *[str(p) for p in input_paths],
+                    "--",
+                    str(output_path),
+                ],
+                "qpdf",
+            )
             return "qpdf"
 
         gs_path = shutil.which("gs")
         if gs_path:
-            cmd = [
-                gs_path,
-                "-dBATCH",
-                "-dNOPAUSE",
-                "-q",
-                "-sDEVICE=pdfwrite",
-                f"-sOutputFile={output_path}",
-                *[str(p) for p in input_paths],
-            ]
-            subprocess.run(cmd, check=True)
+            self._run_merge_cmd(
+                [
+                    gs_path,
+                    "-dBATCH",
+                    "-dNOPAUSE",
+                    "-q",
+                    "-sDEVICE=pdfwrite",
+                    f"-sOutputFile={output_path}",
+                    *[str(p) for p in input_paths],
+                ],
+                "ghostscript",
+            )
             return "ghostscript"
 
         raise RuntimeError("No PDF merge tool found: pdfunite, qpdf, gs")
 
+    def _merge_pdfs(self, input_paths: list[Path], output_path: Path) -> str:
+        """Слить PDF внешней утилитой; при её отсутствии/ошибке — фолбэк на pypdf."""
+        try:
+            return self._run_pdf_merge_tool(input_paths, output_path)
+        except (RuntimeError, subprocess.CalledProcessError) as exc:
+            logger.warning(f"External PDF merge failed ({exc}); falling back to pypdf")
+            self._merge_pdfs_pypdf(input_paths, output_path)
+            return "pypdf"
+
     def _merge_pdf_files_tree(
         self,
-        input_paths: List[Path],
+        input_paths: list[Path],
         output_path: Path,
         fan_in: int = 4,
     ) -> None:
@@ -741,8 +927,8 @@ class YandexOCRAsync:
         round_index = 0
 
         while len(current_paths) > 1:
-            next_paths: List[Path] = []
-            print(
+            next_paths: list[Path] = []
+            logger.info(
                 f"Final PDF merge round {round_index}: "
                 f"{len(current_paths)} files, fan_in={fan_in}"
             )
@@ -757,8 +943,8 @@ class YandexOCRAsync:
                     merge_tmp_dir
                     / f"round_{round_index:04d}_group_{group_index // fan_in:04d}.pdf"
                 )
-                tool_name = self._run_pdf_merge_tool(group, intermediate_path)
-                print(
+                tool_name = self._merge_pdfs(group, intermediate_path)
+                logger.info(
                     f"Merged round={round_index} group={group_index // fan_in} "
                     f"with {tool_name}: {len(group)} -> {intermediate_path.name}"
                 )
@@ -769,7 +955,7 @@ class YandexOCRAsync:
                     if old_path not in input_paths and old_path.exists():
                         old_path.unlink()
                 except Exception as exc:
-                    print(f"Failed to delete intermediate merge file {old_path}: {exc}")
+                    logger.warning(f"Failed to delete intermediate merge file {old_path}: {exc}")
 
             current_paths = next_paths
             round_index += 1
@@ -781,13 +967,13 @@ class YandexOCRAsync:
             output_path.unlink()
 
         if final_candidate == output_path:
-            print(f"Saved final PDF: {output_path}")
+            logger.info(f"Saved final PDF: {output_path}")
             return
 
         final_candidate.replace(output_path)
-        print(f"Saved final PDF: {output_path}")
+        logger.info(f"Saved final PDF: {output_path}")
 
-    def build_final_pdf_from_chunks(self, chunk_ids: List[int]) -> None:
+    def build_final_pdf_from_chunks(self, chunk_ids: list[int]) -> None:
         output_path = self._pdf_result_path()
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -812,7 +998,7 @@ class YandexOCRAsync:
         session: aiohttp.ClientSession,
         chunk_id: int,
         chunk_pdf_path: Path,
-        page_numbers: List[int],
+        page_numbers: list[int],
         max_concurrent: int,
         batch_size: int,
     ) -> None:
@@ -826,11 +1012,9 @@ class YandexOCRAsync:
         effective_parallel_batches = 1 if self.strict_memory_mode else max(1, max_concurrent)
 
         if effective_parallel_batches != 1:
-            import asyncio
-
             semaphore = asyncio.Semaphore(effective_parallel_batches)
 
-            async def _run(batch_path: Path, pages: List[int], batch_id: int) -> None:
+            async def _run(batch_path: Path, pages: list[int], batch_id: int) -> None:
                 async with semaphore:
                     await self.process_batch(session, chunk_id, batch_path, pages, batch_id)
 
@@ -838,7 +1022,11 @@ class YandexOCRAsync:
                 asyncio.create_task(_run(batch_path, pages, batch_id))
                 for batch_path, pages, batch_id in batches
             ]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Ошибку авторизации пробрасываем — нет смысла продолжать весь файл.
+            for r in results:
+                if isinstance(r, OCRAuthError):
+                    raise r
         else:
             for batch_path, pages, batch_id in batches:
                 await self.process_batch(session, chunk_id, batch_path, pages, batch_id)
@@ -859,17 +1047,30 @@ class YandexOCRAsync:
         cleanup_tmp_files: bool = False,
     ) -> None:
         self.init_final_outputs()
+        self._pages_ok = 0
+        self._pages_failed = 0
+        self._failed_pages = []
 
+        started = time.monotonic()
         chunks = self.split_pdf_to_chunks(input_pdf_path=input_pdf_path, chunk_size=chunk_size)
-        print(f"Split into {len(chunks)} chunks")
+        total_pages = sum(len(page_numbers) for _, _, page_numbers in chunks)
+        logger.info(
+            f"Start OCR for {self.base_name}: {total_pages} pages, {len(chunks)} chunks "
+            f"(chunk_size={chunk_size}, batch_size={batch_size}, max_concurrent={max_concurrent})"
+        )
         timeout = ClientTimeout(total=600, connect=120, sock_connect=120, sock_read=300)
         connector = TCPConnector(limit=max(1, max_concurrent), ttl_dns_cache=300)
-        processed_chunk_ids: List[int] = []
+        processed_chunk_ids: list[int] = []
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 for chunk_id, chunk_pdf_path, page_numbers in chunks:
-                    print(f"Processing chunk {chunk_id} with {len(page_numbers)} pages")
+                    logger.info(
+                        f"Processing chunk {chunk_id}/{len(chunks) - 1} "
+                        f"with {len(page_numbers)} pages "
+                        f"(pages {page_numbers[0] + 1}-{page_numbers[-1] + 1})"
+                    )
+                    chunk_started = time.monotonic()
                     await self.process_chunk(
                         session,
                         chunk_id,
@@ -879,17 +1080,41 @@ class YandexOCRAsync:
                         batch_size=batch_size,
                     )
                     processed_chunk_ids.append(chunk_id)
+                    logger.info(
+                        f"Chunk {chunk_id} done in {time.monotonic() - chunk_started:.1f}s"
+                    )
                     gc.collect()
 
             self.finalize_final_json()
 
-            print("Building final PDF from chunk files...")
+            logger.info("Building final PDF from chunk files...")
             self.build_final_pdf_from_chunks(processed_chunk_ids)
 
-            print(f"Uploaded merged result: {self._txt_result_path()}")
-            print(f"Uploaded merged result: {self._json_result_path()}")
-            print(f"Uploaded merged result: {self._pdf_result_path()}")
+            logger.info(
+                f"OCR finished for {self.base_name}: {total_pages} pages in "
+                f"{time.monotonic() - started:.1f}s"
+            )
+            logger.info(
+                f"Pages summary: total={total_pages} ok={self._pages_ok} "
+                f"failed={self._pages_failed}"
+            )
+            logger.info(f"Saved result (txt): {self._txt_result_path()}")
+            logger.info(f"Saved result (json): {self._json_result_path()}")
+            logger.info(f"Saved result (pdf): {self._pdf_result_path()}")
+
+            # Строгая политика: непустая потеря страниц сверх порога => файл failed,
+            # чтобы в индекс не попал неполный документ (его можно перезапустить).
+            if self._pages_failed > self.max_failed_pages:
+                raise RuntimeError(
+                    f"OCR incomplete: {self._pages_failed}/{total_pages} pages failed "
+                    f"(allowed {self.max_failed_pages}); failed pages "
+                    f"e.g. {self._failed_pages[:30]}"
+                )
         except Exception:
+            logger.exception(
+                f"OCR aborted for {self.base_name} after "
+                f"{time.monotonic() - started:.1f}s; processed chunks: {processed_chunk_ids}"
+            )
             try:
                 self.finalize_final_json()
             except Exception:
