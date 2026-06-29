@@ -14,15 +14,22 @@ PDF в Object Storage (фронт кладёт файл под префикс `i
 
 - **Точка входа:** `handler.handler` (`src/handler.py`). Сигнатура `handler(event, context)`;
   `event` — событие Object Storage, ключ берётся из `messages[0].details.object_id`.
-- **Ядро** — класс `YandexOCRAsync` в `src/OCR_async.py`. Хендлер только резолвит путь, дёргает
-  статусы и зовёт `asyncio.run(ocr.process_pdf(...))`.
+- **Ядро** — пакет `src/ocr/` (оркестратор `YandexOCRAsync` в `ocr/pipeline.py`). Хендлер только
+  резолвит путь, дёргает статусы и зовёт `asyncio.run(ocr.process_pdf(...))`. Модули пакета:
+  `ratelimit` (token-bucket/backoff/`OCRAuthError`), `client` (OCR API: submit+поллинг, **два
+  раздельных лимитера**), `render` (рендер страниц в image-PDF, **byte-aware** под лимит 10 МБ),
+  `overlay` (текстовый слой + парсинг ответа), `pdf_split`, `pdf_merge`, `outputs` (`ResultWriter`),
+  `layout` (пути), `fsutil`, `pipeline` (оркестрация).
 - **Бакет монтируется** в ФС функции (READ_WRITE) в `BUCKET_MOUNT_POINT`
   (`/function/storage/<bucket>`). Никакого boto3/S3 API — работа идёт через примонтированную ФС.
   **Не добавляй boto3/botocore** (в прод-requirements они были по ошибке и не использовались).
-- **Шрифт `src/DejaVuSans.ttf` обязателен.** `YandexOCRAsync.__init__` грузит его относительным
-  путём `TTFont("DejaVuSans.ttf")` для текстового слоя searchable-PDF. При деплое
-  (`source-root: ./src`, `include: **`) он попадает в корень функции. Уберёшь файл — функция
-  упадёт на инициализации.
+- **Шрифт `src/DejaVuSans.ttf` обязателен.** `ocr/overlay.register_font()` грузит его относительным
+  путём `TTFont("DejaVuSans.ttf")` для текстового слоя searchable-PDF (cwd функции = корень `src`).
+  При деплое (`source-root: ./src`, `include: **`) он попадает в корень функции. Уберёшь файл —
+  функция упадёт на инициализации.
+- **CPU в одном worker-треде.** `render`/`overlay` — синхронный CPU; в `pipeline` они идут через
+  `ThreadPoolExecutor(max_workers=1)`, чтобы не блокировать event loop (сеть OCR параллельно), но
+  без конкурентного fitz (PyMuPDF **не потокобезопасен** между потоками).
 - **Колбэк статусов в API.** `_patch_status()` шлёт `PATCH {API_BASE_URL}/files/by-key/status`
   с заголовком `x-service-key` и телом `{system_key, status, error_message}`. Последовательность:
   `ocr_processing` → (`ocr_done` | `failed`). Watchdog ловит зависшие на `ocr_processing`.
@@ -106,20 +113,29 @@ ruff check src
 
 ## Rate-limiting OCR API и масштабирование (важно)
 
-OCR API (`recognizeTextAsync`/`getRecognition`) имеет квоту RPS на каталог. Под нагрузкой
-ловили **тысячи 429** на поллинге → потерянные страницы. Защита — в два слоя:
+OCR API имеет **раздельные** квоты RPS на каталог (Yandex): submit `recognizeTextAsync` ≈10 rps,
+поллинг/получение `getRecognition` — по ≈50 rps. Плюс лимиты запроса: **≤200 стр**, **файл ≤10 МБ**.
+Защита от 429 — в два слоя:
 
-1. **Per-file (в коде):** общий async token-bucket `OCR_MAX_RPS` (дефолт 8) на отправку+поллинг
-   + экспоненциальный backoff с `Retry-After` (`recognize_pdf`, `get_operation_result`). Ограничивает
-   RPS **одного инстанса** (= одного файла), чтобы большой документ сам себя не заддосил.
-2. **Глобально (инфра):** `OCR_MAX_RPS` НЕ координирует разные инстансы — каждый файл это отдельный
+1. **Per-file (в коде):** **два раздельных** token-bucket — `OCR_SUBMIT_RPS` (дефолт 8, под квоту
+   submit) и `OCR_POLL_RPS` (дефолт 40, под квоту поллинга) — + экспоненциальный backoff с
+   `Retry-After` (`ocr/client.py`). Ограничивают RPS **одного инстанса** (= одного файла).
+   Чтобы кратно сократить число submit-запросов, отправляем **много страниц на запрос**
+   (`OCR_BATCH_SIZE`, дефолт 10), а `render` режет батч по `OCR_MAX_BATCH_BYTES` (~9 МБ), чтобы
+   запрос не превысил лимит 10 МБ.
+2. **Глобально (инфра):** лимитеры НЕ координируют разные инстансы — каждый файл это отдельный
    вызов функции. Поэтому стоит **scaling policy** `zone-instances-limit=2` на теге `$latest`
    (`yc serverless function set-scaling-policy`). Сеть на 3 подсетях/зонах ⇒ одновременно ≤ `3·2=6`
-   инстансов ⇒ пик глобального RPS ≈ `6 · OCR_MAX_RPS`.
+   инстансов ⇒ пик глобального submit-RPS ≈ `6 · OCR_SUBMIT_RPS`.
 
-**Тюнинг:** ориентир — лог `Pages summary: total/ok/failed` и число `Failed to get result: 429`.
-Много 429/таймаутов → снижай `OCR_MAX_RPS` или `zone-instances-limit`. Мало и медленно → повышай.
-Два регулятора: `zone-instances-limit` (параллельность файлов) и `OCR_MAX_RPS` (нагрузка на файл).
+**После поднятия квоты** (например до 60 rps): достаточно поднять env `OCR_SUBMIT_RPS` (~55) и при
+желании `OCR_BATCH_SIZE` — код менять не нужно.
+
+**Тюнинг:** ориентир — лог `Pages summary: total/ok/failed` и число `poll HTTP 429` / `recognize
+attempt … HTTP 429`. Много 429/таймаутов → снижай `OCR_SUBMIT_RPS`/`OCR_POLL_RPS` или
+`zone-instances-limit`. Мало и медленно → повышай. Регуляторы: `zone-instances-limit`
+(параллельность файлов), `OCR_SUBMIT_RPS`/`OCR_POLL_RPS` (нагрузка на файл), `OCR_BATCH_SIZE`
+(страниц на запрос).
 
 ⚠️ **Кап инстансов может ронять события триггера.** При упоре в лимит часть вызовов от bucket-триггера
 не обработается; у прод-триггера `retry_attempts=1`, поэтому файл рискует застрять в `uploaded`

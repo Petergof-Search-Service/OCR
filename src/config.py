@@ -32,13 +32,18 @@ INPUT_PREFIX = os.getenv("INPUT_PREFIX", "incoming/")
 TMP_PREFIX = os.getenv("TMP_PREFIX", "tmp")
 RESULT_PREFIX = os.getenv("RESULT_PREFIX", "result")
 OCR_STRICT_MEMORY_MODE = _get_bool("OCR_STRICT_MEMORY_MODE", "0")
-OCR_MAX_CONCURRENT = _get_int("OCR_MAX_CONCURRENT", "10")
-OCR_BATCH_SIZE = _get_int("OCR_BATCH_SIZE", "2")
-OCR_CHUNK_SIZE = _get_int("OCR_CHUNK_SIZE", "20")
+OCR_MAX_CONCURRENT = _get_int("OCR_MAX_CONCURRENT", "5")
+# Страниц на один запрос к OCR (ограничение Yandex: ≤200 стр и ≤10 МБ на запрос).
+OCR_BATCH_SIZE = _get_int("OCR_BATCH_SIZE", "10")
+OCR_CHUNK_SIZE = _get_int("OCR_CHUNK_SIZE", "50")
 OCR_DPI = _get_int("OCR_DPI", "100")
 OCR_JPEG_QUALITY = _get_int("OCR_JPEG_QUALITY", "80")
-# Лимит RPS к OCR API (отправка + поллинг) — защита от 429.
-OCR_MAX_RPS = _get_float("OCR_MAX_RPS", "8")
+# Раздельные квоты Yandex OCR: submit (recognizeTextAsync) ≈10 rps,
+# поллинг (getRecognition) ≈50 rps. Поднимаешь квоту через ТП — растишь OCR_SUBMIT_RPS.
+OCR_SUBMIT_RPS = _get_float("OCR_SUBMIT_RPS", "8")
+OCR_POLL_RPS = _get_float("OCR_POLL_RPS", "40")
+# Потолок размера одного запроса (байт PDF). Лимит Yandex — 10 МБ, держим запас.
+OCR_MAX_BATCH_BYTES = _get_int("OCR_MAX_BATCH_BYTES", "9000000", minimum=100000)
 # Сколько потерянных страниц допустимо, прежде чем файл уйдёт в failed (0 = строго).
 OCR_MAX_FAILED_PAGES = _get_int("OCR_MAX_FAILED_PAGES", "0", minimum=0)
 
