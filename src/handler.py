@@ -15,10 +15,12 @@ from config import (
     OCR_CHUNK_SIZE,
     OCR_DPI,
     OCR_JPEG_QUALITY,
+    OCR_MAX_BATCH_BYTES,
     OCR_MAX_CONCURRENT,
     OCR_MAX_FAILED_PAGES,
-    OCR_MAX_RPS,
+    OCR_POLL_RPS,
     OCR_STRICT_MEMORY_MODE,
+    OCR_SUBMIT_RPS,
     RESULT_PREFIX,
     TMP_PREFIX,
     YANDEX_API_KEY,
@@ -114,14 +116,16 @@ def handler(event, context):
                 "chunk_size": OCR_CHUNK_SIZE,
                 "dpi": OCR_DPI,
                 "jpeg_quality": OCR_JPEG_QUALITY,
-                "max_rps": OCR_MAX_RPS,
+                "submit_rps": OCR_SUBMIT_RPS,
+                "poll_rps": OCR_POLL_RPS,
+                "max_batch_bytes": OCR_MAX_BATCH_BYTES,
                 "max_failed_pages": OCR_MAX_FAILED_PAGES,
             },
             ensure_ascii=False,
         ),
     )
 
-    from OCR_async import YandexOCRAsync
+    from ocr import YandexOCRAsync
 
     ocr = YandexOCRAsync(
         api_key=YANDEX_API_KEY,
@@ -133,7 +137,9 @@ def handler(event, context):
         dpi=OCR_DPI,
         jpeg_quality=OCR_JPEG_QUALITY,
         strict_memory_mode=OCR_STRICT_MEMORY_MODE,
-        max_rps=OCR_MAX_RPS,
+        submit_rps=OCR_SUBMIT_RPS,
+        poll_rps=OCR_POLL_RPS,
+        max_batch_bytes=OCR_MAX_BATCH_BYTES,
         max_failed_pages=OCR_MAX_FAILED_PAGES,
     )
 
